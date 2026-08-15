@@ -9,12 +9,21 @@ Data survives node restarts, node death, and network partitions. Member nodes re
 ```elixir
 def deps do
   [
-    {:ekv, "~> 0.4.3"}
+    {:ekv,
+     git: "https://github.com/Factory-Twelve/ekv.git",
+     ref: "<reviewed-40-character-commit-sha>"}
   ]
 end
 ```
 
-EKV uses sqlite as the storage layer. Precompiled NIF binaries are available for common platforms. If a precompiled binary isn't available for your system, it will compile from source (requires a C compiler).
+Replace the placeholder with the full reviewed commit SHA. This source line is
+consumed from Git; the Hex `ekv` package does not contain these changes.
+
+EKV uses sqlite as the storage layer. This Factory Twelve source line always
+compiles the vendored SQLite NIF from the checked-out source in every Mix
+environment. Its package contains no precompiled NIF or precompiled-download
+configuration, and its production build succeeds with network access disabled.
+A C compiler is required when compiling the dependency.
 
 ## Usage
 

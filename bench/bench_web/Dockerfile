@@ -10,7 +10,6 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 ENV MIX_ENV=prod
-ENV EKV_BUILD=1
 ENV MIX_BUILD_ROOT=/app/.mix_build
 WORKDIR /app
 
