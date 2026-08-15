@@ -4027,6 +4027,26 @@ defmodule EKVTest do
       assert EKV.get(name, "ttl/u") == "val"
     end
 
+    test "oversized update and consistent put values do not restart the shard", %{
+      cas_name: name
+    } do
+      key = "u/oversized"
+      shard_index = EKV.Replica.shard_index_for(key, 2)
+      shard = EKV.Replica.shard_name(name, shard_index)
+      shard_pid = Process.whereis(shard)
+      oversized_value = :binary.copy(<<0>>, EKV.ValueCodec.max_encoded_bytes())
+
+      assert {:error, :invalid_value} = EKV.update(name, key, fn _ -> oversized_value end)
+      assert Process.whereis(shard) == shard_pid
+
+      assert {:error, :invalid_value} =
+               EKV.put(name, key, oversized_value, consistent: true)
+
+      assert Process.whereis(shard) == shard_pid
+      assert {:ok, "valid", _vsn} = EKV.update(name, key, fn _ -> "valid" end)
+      assert EKV.get(name, key) == "valid"
+    end
+
     test "rejects invalid retries and backoff at call site", %{cas_name: name} do
       assert_raise ArgumentError, ~r/:retries must be a non-negative integer/, fn ->
         EKV.update(name, "opt/u1", fn nil -> "val" end, retries: -1)

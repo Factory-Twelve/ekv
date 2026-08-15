@@ -24,6 +24,9 @@ defmodule EKV.ValueCodecTest do
 
     oversized = :binary.copy(<<0>>, ValueCodec.max_encoded_bytes() + 1)
     assert {:error, :encoded_value_too_large} = ValueCodec.decode(oversized)
+
+    oversized_value = :binary.copy(<<0>>, ValueCodec.max_encoded_bytes())
+    assert {:error, :encoded_value_too_large} = ValueCodec.encode(oversized_value)
   end
 
   test "decoded heap growth is bounded" do

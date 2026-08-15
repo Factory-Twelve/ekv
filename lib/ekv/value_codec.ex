@@ -18,6 +18,7 @@ defmodule EKV.ValueCodec do
           | :trailing_bytes
           | :decoded_value_too_large
           | :invalid_or_unsafe_external_term
+  @type encode_error :: decode_error() | :round_trip_mismatch
 
   @spec max_encoded_bytes() :: pos_integer()
   def max_encoded_bytes, do: @max_encoded_bytes
@@ -25,16 +26,27 @@ defmodule EKV.ValueCodec do
   @spec max_decoded_heap_words() :: pos_integer()
   def max_decoded_heap_words, do: @max_decoded_heap_words
 
-  @spec encode!(term(), term()) :: binary()
-  def encode!(value, context \\ :encode) do
+  @spec encode(term()) :: {:ok, binary()} | {:error, encode_error()}
+  def encode(value) do
     value_binary = :erlang.term_to_binary(value)
 
     case decode(value_binary) do
       {:ok, ^value} ->
-        value_binary
+        {:ok, value_binary}
 
       {:ok, _other} ->
-        raise ArgumentError, "EKV could not safely encode value for #{inspect(context)}"
+        {:error, :round_trip_mismatch}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec encode!(term(), term()) :: binary()
+  def encode!(value, context \\ :encode) do
+    case encode(value) do
+      {:ok, value_binary} ->
+        value_binary
 
       {:error, reason} ->
         raise ArgumentError,

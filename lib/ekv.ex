@@ -683,6 +683,8 @@ defmodule EKV do
     is the persisted origin string (normally the stable member `node_id`)
   - With `resolve_unconfirmed: true`, CAS put may also return
     `{:error, :unavailable}` if ambiguity resolution cannot complete.
+  - Consistent CAS put returns `{:error, :invalid_value}` when the value cannot
+    be encoded within EKV's persisted-value safety limits.
   """
   def put(name, key, value, opts \\ []) do
     WireEnvelope.validate_key!(key)
@@ -973,6 +975,8 @@ defmodule EKV do
   Returns `{:error, :unconfirmed}` when accept phase started but the caller could
   not confirm final outcome; issue `get(name, key, consistent: true)` to
   resolve.
+  Returns `{:error, :invalid_value}` when the callback result cannot be encoded
+  within EKV's persisted-value safety limits.
 
   Requires `cluster_size` config. Member mode auto-generates/persists
   `node_id` if omitted.

@@ -5873,6 +5873,10 @@ defmodule EKV.Replica do
           current_value,
           current_vsn
         )
+
+      {:error, reason} ->
+        reply_cas_error(op, {:error, reason})
+        %{state | pending_cas: Map.delete(state.pending_cas, ref)}
     end
   end
 
@@ -6029,18 +6033,22 @@ defmodule EKV.Replica do
 
       {:update, fun, opts, _retries} ->
         new_value = apply_update_callback(fun, current_value)
-        new_value_binary = ValueCodec.encode!(new_value, {:update, key})
-        now = monotonic_cas_ts(current_vsn)
-        origin = local_origin_id(state)
-        origin_str = origin
-        ttl = Keyword.get(opts, :ttl)
-        expires_at = if ttl, do: now + ttl * 1_000_000
 
-        entry_tuple = {key, new_value_binary, now, origin_str, expires_at, nil}
-        broadcast_msg = {:ekv_put, key, new_value_binary, now, origin, expires_at}
-        events = [%EKV.Event{type: :put, key: key, value: new_value}]
-        reply_value = {:ok, new_value, {now, origin}}
-        {:ok, new_value_binary, entry_tuple, reply_value, broadcast_msg, events}
+        with {:ok, new_value_binary} <- ValueCodec.encode(new_value) do
+          now = monotonic_cas_ts(current_vsn)
+          origin = local_origin_id(state)
+          origin_str = origin
+          ttl = Keyword.get(opts, :ttl)
+          expires_at = if ttl, do: now + ttl * 1_000_000
+
+          entry_tuple = {key, new_value_binary, now, origin_str, expires_at, nil}
+          broadcast_msg = {:ekv_put, key, new_value_binary, now, origin, expires_at}
+          events = [%EKV.Event{type: :put, key: key, value: new_value}]
+          reply_value = {:ok, new_value, {now, origin}}
+          {:ok, new_value_binary, entry_tuple, reply_value, broadcast_msg, events}
+        else
+          {:error, _reason} -> {:error, :invalid_value}
+        end
 
       {:cas_read, _opts, _retries} ->
         # Unreachable: cas_read recovery is handled via apply_cas_read_recovery
