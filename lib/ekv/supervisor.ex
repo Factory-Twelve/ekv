@@ -4,12 +4,18 @@ defmodule EKV.Supervisor do
 
   require Logger
 
+  alias EKV.WireEnvelope
+  alias EKV.CAS.Ballot
+
   @default_member_progress_retention_ttl :timer.hours(6)
   @default_handoff_ack_timeout_ms 60_000
   @handoff_task_timeout_buffer_ms 30_000
   @default_max_reader_connections 16
   @default_wal_checkpoint_interval 1_000
   @default_wal_size_limit 64 * 1024 * 1024
+  @max_wire_batch_entries WireEnvelope.max_batch_entries()
+  @max_wire_batch_bytes WireEnvelope.max_batch_bytes()
+  @max_origin_bytes WireEnvelope.max_origin_bytes()
 
   _archdoc = ~S"""
   Top-level EKV supervisor.
@@ -654,30 +660,41 @@ defmodule EKV.Supervisor do
   # CAS config validation
   # =====================================================================
 
-  defp validate_cas_config!(nil, _node_id), do: :ok
-
   defp validate_cas_config!(cluster_size, node_id) do
-    unless is_integer(cluster_size) and cluster_size >= 1 do
+    unless is_nil(cluster_size) or (is_integer(cluster_size) and cluster_size >= 1) do
       raise ArgumentError,
             "EKV: :cluster_size must be a positive integer, got: #{inspect(cluster_size)}"
     end
 
+    validate_node_id!(node_id)
+  end
+
+  defp validate_node_id!(node_id) do
     # node_id is optional (auto-generated and persisted if nil)
     # If provided, must be a string or positive integer (converted to string)
-    case node_id do
-      nil ->
+    normalized =
+      case node_id do
+        nil -> :optional
+        id when is_binary(id) -> {:ok, id}
+        id when is_integer(id) and id >= 1 -> WireEnvelope.normalize_origin(id)
+        _invalid -> :error
+      end
+
+    case normalized do
+      :optional ->
         :ok
 
-      id when is_binary(id) and byte_size(id) > 0 ->
-        :ok
+      {:ok, id} ->
+        if Ballot.valid_node_id?(id), do: :ok, else: raise_invalid_node_id!(node_id)
 
-      id when is_integer(id) and id >= 1 ->
-        :ok
-
-      _ ->
-        raise ArgumentError,
-              "EKV: :node_id must be a non-empty string or positive integer, got: #{inspect(node_id)}"
+      _invalid ->
+        raise_invalid_node_id!(node_id)
     end
+  end
+
+  defp raise_invalid_node_id!(node_id) do
+    raise ArgumentError,
+          "EKV: :node_id must be a non-empty string or positive integer, without NUL bytes and no larger than #{@max_origin_bytes} bytes, got: #{inspect(node_id)}"
   end
 
   defp validate_partition_ttl_policy!(policy)
@@ -721,26 +738,30 @@ defmodule EKV.Supervisor do
   defp resolve_member_node_id(name, data_dir, configured_node_id) do
     persisted = EKV.Store.read_node_id(data_dir)
 
-    cond do
-      persisted != nil and configured_node_id != nil and persisted != configured_node_id ->
-        Logger.warning(
-          "[EKV #{name}] configured node_id #{inspect(configured_node_id)} differs from " <>
-            "persisted #{inspect(persisted)} (volume identity) — using persisted"
-        )
+    effective_node_id =
+      cond do
+        persisted != nil and configured_node_id != nil and persisted != configured_node_id ->
+          Logger.warning(
+            "[EKV #{name}] configured node_id #{inspect(configured_node_id)} differs from " <>
+              "persisted #{inspect(persisted)} (volume identity) — using persisted"
+          )
 
-        persisted
+          persisted
 
-      persisted != nil ->
-        persisted
+        persisted != nil ->
+          persisted
 
-      configured_node_id != nil ->
-        configured_node_id
+        configured_node_id != nil ->
+          configured_node_id
 
-      true ->
-        generated = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
-        Logger.info("[EKV #{name}] generated node_id: #{generated}")
-        generated
-    end
+        true ->
+          generated = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+          Logger.info("[EKV #{name}] generated node_id: #{generated}")
+          generated
+      end
+
+    validate_node_id!(effective_node_id)
+    effective_node_id
   end
 
   defp validate_shutdown_barrier!(false), do: :ok
@@ -894,8 +915,14 @@ defmodule EKV.Supervisor do
   end
 
   defp validate_replication_batch_max_entries!(entries)
-       when is_integer(entries) and entries > 0,
+       when is_integer(entries) and entries > 0 and entries <= @max_wire_batch_entries,
        do: :ok
+
+  defp validate_replication_batch_max_entries!(entries)
+       when is_integer(entries) and entries > @max_wire_batch_entries do
+    raise ArgumentError,
+          "EKV: :replication_batch_max_entries must be at most #{@max_wire_batch_entries}, got: #{inspect(entries)}"
+  end
 
   defp validate_replication_batch_max_entries!(entries) do
     raise ArgumentError,
@@ -903,16 +930,29 @@ defmodule EKV.Supervisor do
   end
 
   defp validate_replication_batch_max_bytes!(bytes)
-       when is_integer(bytes) and bytes > 0,
+       when is_integer(bytes) and bytes > 0 and bytes <= @max_wire_batch_bytes,
        do: :ok
+
+  defp validate_replication_batch_max_bytes!(bytes)
+       when is_integer(bytes) and bytes > @max_wire_batch_bytes do
+    raise ArgumentError,
+          "EKV: :replication_batch_max_bytes must be at most #{@max_wire_batch_bytes} bytes, got: #{inspect(bytes)}"
+  end
 
   defp validate_replication_batch_max_bytes!(bytes) do
     raise ArgumentError,
           "EKV: :replication_batch_max_bytes must be a positive byte count, got: #{inspect(bytes)}"
   end
 
-  defp validate_sync_chunk_size!(size) when is_integer(size) and size > 0,
-    do: :ok
+  defp validate_sync_chunk_size!(size)
+       when is_integer(size) and size > 0 and size <= @max_wire_batch_entries,
+       do: :ok
+
+  defp validate_sync_chunk_size!(size)
+       when is_integer(size) and size > @max_wire_batch_entries do
+    raise ArgumentError,
+          "EKV: :sync_chunk_size must be at most #{@max_wire_batch_entries}, got: #{inspect(size)}"
+  end
 
   defp validate_sync_chunk_size!(size) do
     raise ArgumentError,
@@ -920,8 +960,14 @@ defmodule EKV.Supervisor do
   end
 
   defp validate_sync_chunk_max_bytes!(bytes)
-       when is_integer(bytes) and bytes > 0,
+       when is_integer(bytes) and bytes > 0 and bytes <= @max_wire_batch_bytes,
        do: :ok
+
+  defp validate_sync_chunk_max_bytes!(bytes)
+       when is_integer(bytes) and bytes > @max_wire_batch_bytes do
+    raise ArgumentError,
+          "EKV: :sync_chunk_max_bytes must be at most #{@max_wire_batch_bytes} bytes, got: #{inspect(bytes)}"
+  end
 
   defp validate_sync_chunk_max_bytes!(bytes) do
     raise ArgumentError,

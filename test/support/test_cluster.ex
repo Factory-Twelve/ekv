@@ -35,6 +35,53 @@ defmodule EKV.TestCluster do
     :erpc.call(node, mod, fun, args)
   end
 
+  @doc "Start a remote process that forwards every received message to the owner"
+  def start_message_relay(node, owner) when is_atom(node) and is_pid(owner) do
+    rpc!(node, __MODULE__, :do_start_message_relay, [owner])
+  end
+
+  @doc false
+  def do_start_message_relay(owner) when is_pid(owner) do
+    spawn(fn -> message_relay_loop(owner) end)
+  end
+
+  defp message_relay_loop(owner) do
+    receive do
+      :stop ->
+        :ok
+
+      message ->
+        send(owner, message)
+        message_relay_loop(owner)
+    end
+  end
+
+  @doc "Start a remote relay that can emit messages and tags replies with its pid"
+  def start_wire_relay(node, owner) when is_atom(node) and is_pid(owner) do
+    rpc!(node, __MODULE__, :do_start_wire_relay, [owner])
+  end
+
+  @doc false
+  def do_start_wire_relay(owner) when is_pid(owner) do
+    spawn(fn -> wire_relay_loop(owner) end)
+  end
+
+  defp wire_relay_loop(owner) do
+    receive do
+      {:emit, target, message, ack_ref} when is_pid(target) and is_reference(ack_ref) ->
+        send(target, message)
+        send(owner, {:wire_emitted, ack_ref})
+        wire_relay_loop(owner)
+
+      :stop ->
+        :ok
+
+      message ->
+        send(owner, {:wire_reply, self(), message})
+        wire_relay_loop(owner)
+    end
+  end
+
   @doc "Start EKV on a remote node"
   def start_ekv(node, opts) do
     opts = Keyword.put_new(opts, :log, false)
@@ -914,7 +961,7 @@ defmodule EKV.TestCluster do
 
     send(
       shard_name,
-      {:ekv, 1, :summary_reply, {remote_pid, shard_index, remote_progress},
+      {:ekv, 2, :summary_reply, {remote_pid, shard_index, remote_progress},
        %{node_id: remote_node_id}}
     )
 

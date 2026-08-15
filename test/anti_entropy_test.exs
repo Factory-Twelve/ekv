@@ -127,7 +127,8 @@ defmodule EKV.AntiEntropyTest do
           timeout
         )
 
-      {:trace, _pid, :send, {:ekv, 1, :sync, {from_node, shard, _mode, entries, progress}, _meta},
+      {:trace, _pid, :send,
+       {:ekv, 2, :sync, {from_node, shard, _request_id, _mode, entries, progress}, _meta},
        destination} ->
         collect_sync_messages(
           [
@@ -150,8 +151,8 @@ defmodule EKV.AntiEntropyTest do
       {:trace, _pid, :send, {:ekv_sync_request, _from_pid, shard, request}, destination} ->
         collect_sync_request_messages([{shard, request, destination} | acc], timeout)
 
-      {:trace, _pid, :send, {:ekv, 1, :sync_request, {_from_pid, shard, request}, _meta},
-       destination} ->
+      {:trace, _pid, :send,
+       {:ekv, 2, :sync_request, {_from_pid, shard, request, _request_id}, _meta}, destination} ->
         collect_sync_request_messages([{shard, request, destination} | acc], timeout)
 
       {:trace, _pid, :send, _msg, _destination} ->
@@ -170,8 +171,8 @@ defmodule EKV.AntiEntropyTest do
     timeout = max(deadline_ms - System.monotonic_time(:millisecond), 0)
 
     receive do
-      {:trace, _pid, :send, {:ekv, 1, :sync_request, {_from_pid, shard, request}, meta},
-       destination} ->
+      {:trace, _pid, :send,
+       {:ekv, 2, :sync_request, {_from_pid, shard, request, _request_id}, meta}, destination} ->
         do_collect_sync_request_meta_messages(
           [{shard, request, meta, destination} | acc],
           deadline_ms
@@ -189,8 +190,8 @@ defmodule EKV.AntiEntropyTest do
       {:trace, _pid, :send, {:ekv_sync_request, _from_pid, shard, request}, destination} ->
         collect_trace_messages([{:request, shard, request, destination} | acc], timeout)
 
-      {:trace, _pid, :send, {:ekv, 1, :sync_request, {_from_pid, shard, request}, _meta},
-       destination} ->
+      {:trace, _pid, :send,
+       {:ekv, 2, :sync_request, {_from_pid, shard, request, _request_id}, _meta}, destination} ->
         collect_trace_messages([{:request, shard, request, destination} | acc], timeout)
 
       {:trace, _pid, :send, {:ekv_sync, from_node, shard, mode, entries, progress}, destination} ->
@@ -203,7 +204,8 @@ defmodule EKV.AntiEntropyTest do
           timeout
         )
 
-      {:trace, _pid, :send, {:ekv, 1, :sync, {from_node, shard, mode, entries, progress}, _meta},
+      {:trace, _pid, :send,
+       {:ekv, 2, :sync, {from_node, shard, _request_id, mode, entries, progress}, _meta},
        destination} ->
         collect_trace_messages(
           [
@@ -215,7 +217,7 @@ defmodule EKV.AntiEntropyTest do
         )
 
       {:trace, _pid, :send,
-       {:ekv, 1, :replication_batch, {from_node, shard, origin, entries}, _meta}, destination} ->
+       {:ekv, 2, :replication_batch, {from_node, shard, origin, entries}, _meta}, destination} ->
         collect_trace_messages(
           [
             {:replication_batch, from_node, shard, origin, Enum.map(entries, &elem(&1, 0)),
@@ -236,8 +238,9 @@ defmodule EKV.AntiEntropyTest do
     assert collect_sync_messages([], timeout) == []
   end
 
-  defp progress_seq(from_node, progress) when is_map(progress),
-    do: Map.get(progress, from_node, 0)
+  defp progress_seq(from_node, progress) when is_map(progress) do
+    Map.get(progress, from_node) || Enum.max(Map.values(progress), fn -> 0 end)
+  end
 
   defp progress_seq(_from_node, _progress), do: 0
 
@@ -278,9 +281,7 @@ defmodule EKV.AntiEntropyTest do
           to_string(origin_node)
       end
 
-    Enum.find_value(state.member_node_ids, origin_id, fn {member_node, member_node_id} ->
-      if member_node_id == origin_id or Atom.to_string(member_node) == origin_id, do: member_node
-    end) || origin_id
+    origin_id
   end
 
   describe "anti-entropy healing" do
@@ -477,7 +478,7 @@ defmodule EKV.AntiEntropyTest do
       shard_name = EKV.Replica.shard_name(ekv_name, 0)
 
       assert_receive {:trace, _pid, :send,
-                      {:ekv, 1, :summary_probe, {_from_pid, 0, _progress},
+                      {:ekv, 2, :summary_probe, {_from_pid, 0, _progress},
                        %{node_id: sent_node_id}}, {^shard_name, ^node_b}},
                      1_500
 
@@ -560,7 +561,7 @@ defmodule EKV.AntiEntropyTest do
 
       TestCluster.rpc!(node_b, :erlang, :send, [
         EKV.Replica.shard_name(ekv_name, 0),
-        {:ekv, 1, :summary_reply, {remote_pid, 0, %{origin_id => stale_seq}},
+        {:ekv, 2, :summary_reply, {remote_pid, 0, %{origin_id => stale_seq}},
          %{node_id: assigned_node_id(peers, node_c)}}
       ])
 
@@ -577,8 +578,9 @@ defmodule EKV.AntiEntropyTest do
                      750
 
       refute_receive {:trace, _pid, :send,
-                      {:ekv, 1, :sync_request, {_from_pid, 0, {:delta, ^origin_id, ^stale_seq}},
-                       _meta}, {^shard_name, ^node_a}},
+                      {:ekv, 2, :sync_request,
+                       {_from_pid, 0, {:delta, ^origin_id, ^stale_seq}, _request_id}, _meta},
+                      {^shard_name, ^node_a}},
                      250
 
       assert :ok = TestCluster.untrace_shard_sends(node_b, ekv_name)
@@ -603,7 +605,7 @@ defmodule EKV.AntiEntropyTest do
 
       TestCluster.rpc!(node_a, :erlang, :send, [
         EKV.Replica.shard_name(ekv_name, 0),
-        {:ekv, 1, :summary_reply, {remote_pid, 0, %{}},
+        {:ekv, 2, :summary_reply, {remote_pid, 0, %{}},
          %{node_id: assigned_node_id(peers, node_b)}}
       ])
 
@@ -715,7 +717,10 @@ defmodule EKV.AntiEntropyTest do
       assert :ok = TestCluster.trace_shard_sends(node_b, ekv_name, self())
 
       ballot_c = elem(vsn1, 0) + 10_000
-      ballot_n = "gap-cas"
+      ballot_n = origin_a
+
+      proposer_pid =
+        TestCluster.rpc!(node_a, Process, :whereis, [EKV.Replica.shard_name(ekv_name, 0)])
 
       assert :ok =
                TestCluster.inject_paxos_accept(node_b, ekv_name, key, "v3", ballot_c, ballot_n,
@@ -727,7 +732,7 @@ defmodule EKV.AntiEntropyTest do
 
       TestCluster.rpc!(node_b, :erlang, :send, [
         EKV.Replica.shard_name(ekv_name, 0),
-        {:ekv_cas_committed, key, ballot_c, ballot_n, entry_tuple, 0, origin_a, 3}
+        {:ekv_cas_committed, proposer_pid, key, ballot_c, ballot_n, entry_tuple, 0, origin_a, 3}
       ])
 
       requests = collect_sync_request_messages([], 500)
@@ -868,7 +873,8 @@ defmodule EKV.AntiEntropyTest do
       requests = collect_sync_request_messages([], 1_000)
 
       assert Enum.any?(requests, fn {shard, request, _destination} ->
-               shard == 0 and request == {:delta, node_a, 0}
+               shard == 0 and
+                 request == {:delta, traced_origin_id(node_b, ekv_name, node_a, peers), 0}
              end)
 
       refute Enum.any?(requests, fn {shard, request, _destination} ->
@@ -2133,7 +2139,7 @@ defmodule EKV.AntiEntropyTest do
       shard_name = EKV.Replica.shard_name(ekv_name, 0)
 
       assert_receive {:trace, _pid, :send,
-                      {:ekv, 1, :member_connect, {_from_pid, 0, _num_shards, _progress, _node_id},
+                      {:ekv, 2, :member_connect, {_from_pid, 0, _num_shards, _progress, _node_id},
                        _meta}, {^shard_name, ^node_b}},
                      1_000
 

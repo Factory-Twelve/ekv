@@ -104,7 +104,15 @@ EKV.subscribe(:my_kv, "room/")
 EKV.unsubscribe(:my_kv, "room/")
 ```
 
-Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are strings.
+Values can be any Erlang term accepted by EKV's safe external-term decoder and
+whose uncompressed encoding is at most 7,994,368 bytes, leaving room for the
+bounded key, origin, and metadata inside the hard 8 MiB wire envelope. EKV
+stores values with
+`:erlang.term_to_binary/1`; reads reject compressed, trailing, corrupt, or unsafe
+external terms and never create atoms. Every atom in a durable value must
+therefore already exist in the running release. Decoding runs in an isolated
+process capped at 1,048,576 heap words, so a compact ETF cannot expand without
+bound. Keys are strings no larger than 64 KiB.
 
 ## Options
 
@@ -125,8 +133,8 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:member_progress_retention_ttl` | `min(:tombstone_ttl, 21_600_000)` (6 hours by default) | Member and observer mode only. How long disconnected durable replicas keep anchoring replay retention before their `kv_member_progress` rows may be pruned. This is the main guard against partitions turning into full syncs after a GC; `0` restores the old immediate-prune behavior. |
 | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, waits for this EKV member to reach CAS quorum. In observer and client mode, waits for the selected backend voter to report CAS quorum reachable. |
 | `:anti_entropy_interval` | `30_000` (30 sec) | Member and observer mode only. Periodic background repair for already-connected durable replicas. Re-runs the normal HWM-driven delta/full sync path to heal missed replication without waiting for reconnect. Must be a positive timeout in ms. |
-| `:sync_chunk_size` | `500` | Member and observer mode only. Max entries per delta/full sync chunk during anti-entropy and catch-up. |
-| `:sync_chunk_max_bytes` | `:replication_batch_max_bytes` | Member and observer mode only. Approximate uncompressed byte cap for delta/full sync chunks. Count and byte limits are both enforced; one oversized entry may exceed this cap so sync can make progress. |
+| `:sync_chunk_size` | `500` | Member and observer mode only. Max entries per delta/full sync chunk during anti-entropy and catch-up. Must be at most 4,096. |
+| `:sync_chunk_max_bytes` | `:replication_batch_max_bytes` | Member and observer mode only. Uncompressed envelope-byte flush threshold for delta/full sync chunks. Must be at most 8 MiB. A single entry may exceed a lower configured threshold, but keys, origins, progress, values, and metadata together never exceed the hard 8 MiB receiver ceiling. |
 | `:delta_sync_log_min_entries` | `8` | Member and observer mode only. Suppresses per-delta `info` logs for successful terminal delta syncs smaller than this many entries. `:verbose` logging still prints all deltas. |
 | `:delta_sync_storm_window` | `60_000` (60 sec) | Member and observer mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
 | `:delta_sync_storm_threshold` | `100` | Member and observer mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
@@ -137,8 +145,8 @@ Values can be any Erlang term (stored via `:erlang.term_to_binary/1`). Keys are 
 | `:wal_checkpoint_interval` | `1_000` (1 sec) | Member and observer mode only. Target interval between passive checkpoints of the same shard. One background process visits independent shard databases round-robin so their checkpoint I/O cannot pile up. |
 | `:wal_size_limit` | `67_108_864` (64 MB) | Member and observer mode only. SQLite journal size retained after a completed WAL reset. An active burst or pinned read transaction may temporarily exceed this value; EKV reports checkpoint starvation when a reader prevents progress beyond the limit. |
 | `:replication_batch_flush_ms` | `3` | Member and observer mode only. Max time one live LWW replication batch may stay queued per destination shard before EKV flushes it. |
-| `:replication_batch_max_entries` | `64` | Member and observer mode only. Max live LWW replication operations EKV queues per destination shard before flushing immediately. |
-| `:replication_batch_max_bytes` | `262_144` (256 KB) | Member and observer mode only. Max encoded byte size of one live LWW replication batch per destination shard before flushing immediately. Replication turn-taking itself is not separately configurable today. |
+| `:replication_batch_max_entries` | `64` | Member and observer mode only. Max live LWW replication operations EKV queues per destination shard before flushing immediately. Must be at most 4,096. |
+| `:replication_batch_max_bytes` | `262_144` (256 KB) | Member and observer mode only. Envelope-byte flush threshold for one live LWW replication batch per destination shard. Must be at most 8 MiB. A single entry may exceed a lower configured threshold, but the complete message never exceeds the hard receiver ceiling. Replication turn-taking itself is not separately configurable today. |
 | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so members can finish final writes and replication. |
 | `:allow_stale_startup` | `false` | Member and observer mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
 | `:blue_green` | `false` | Member and observer mode only. Enable blue-green deployment handoff for shared-volume replacement nodes. |

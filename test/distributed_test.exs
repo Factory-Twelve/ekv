@@ -117,7 +117,14 @@ defmodule EKV.DistributedTest do
       start_cluster(peers, ekv_name)
       on_exit(fn -> cleanup_data(peers, ekv_name) end)
 
-      value = %{users: [%{id: 1, name: "Alice"}, %{id: 2, name: "Bob"}], count: 2}
+      value = %{
+        "users" => [
+          %{"id" => 1, "name" => "Alice"},
+          %{"id" => 2, "name" => "Bob"}
+        ],
+        "count" => 2
+      }
+
       TestCluster.rpc!(node_a, EKV, :put, [ekv_name, "complex", value])
 
       TestCluster.assert_eventually(fn ->

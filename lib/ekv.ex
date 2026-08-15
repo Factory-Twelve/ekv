@@ -106,8 +106,15 @@ defmodule EKV do
         resolve_unconfirmed: true
       )
 
-  Values can be any Erlang/Elixir term. They are stored as `:erlang.term_to_binary/1`
-  internally and deserialized with `:erlang.binary_to_term/1` on read.
+  Values can be any Erlang/Elixir term accepted by EKV's safe external-term
+  decoder and whose uncompressed encoding is at most 7,994,368 bytes, leaving
+  room for the bounded key, origin, and metadata inside the hard 8 MiB wire
+  envelope. Values are stored
+  with `:erlang.term_to_binary/1`; reads reject compressed, trailing, corrupt,
+  or unsafe external terms and never create atoms. Every atom in a durable value
+  must therefore already exist in the running release. Decoding runs in an
+  isolated process capped at 1,048,576 heap words, so compact encodings cannot
+  expand without bound.
   *Note*: Avoid storing structs or anonymous functions within values.
   See `Value Serialization Caveats` below for more information.
 
@@ -255,8 +262,8 @@ defmodule EKV do
   | `:node_id` | auto-generated+persistent | Member and observer mode only. Stable logical durable-replica identity used by CAS ballots, persisted replay origins, member-progress retention, and blue-green overlap. Auto-generated on first boot if omitted, then reused from disk. |
   | `:wait_for_quorum` | `false` | Optional startup gate. In member mode, blocks startup until this EKV member can reach CAS quorum. In observer and client mode, blocks startup until the selected backend voter reports CAS quorum reachable. |
   | `:anti_entropy_interval` | `30_000` (30 sec) | Member and observer mode only. Periodic background repair for already-connected durable replicas. Re-runs the normal HWM-driven delta/full sync path to heal missed replication without waiting for reconnect. Must be a positive timeout in ms. |
-  | `:sync_chunk_size` | `500` | Member and observer mode only. Max entries per delta/full sync chunk during anti-entropy and catch-up. |
-  | `:sync_chunk_max_bytes` | `:replication_batch_max_bytes` | Member and observer mode only. Approximate uncompressed byte cap for delta/full sync chunks. Count and byte limits are both enforced; one oversized entry may exceed this cap so sync can make progress. |
+  | `:sync_chunk_size` | `500` | Member and observer mode only. Max entries per delta/full sync chunk during anti-entropy and catch-up. Must be at most 4,096. |
+  | `:sync_chunk_max_bytes` | `:replication_batch_max_bytes` | Member and observer mode only. Uncompressed envelope-byte flush threshold for delta/full sync chunks. Must be at most 8 MiB. A single entry may exceed a lower configured threshold, but keys, origins, progress, values, and metadata together never exceed the hard 8 MiB receiver ceiling. |
   | `:delta_sync_log_min_entries` | `8` | Member and observer mode only. Suppresses per-delta `info` logs for successful terminal delta syncs smaller than this many entries. `:verbose` logging still prints all deltas. |
   | `:delta_sync_storm_window` | `60_000` (60 sec) | Member and observer mode only. Rolling per-shard window used to aggregate delta sync activity for storm detection. |
   | `:delta_sync_storm_threshold` | `100` | Member and observer mode only. When a shard sends at least this many delta syncs inside one storm window, EKV emits a single aggregated warning for that window. `false`/`nil` disables storm warnings. |
@@ -267,8 +274,8 @@ defmodule EKV do
   | `:wal_checkpoint_interval` | `1_000` (1 sec) | Member and observer mode only. Target interval between passive checkpoints of the same shard. One background process visits independent shard databases round-robin so checkpoint I/O does not overlap across shard files. |
   | `:wal_size_limit` | `67_108_864` (64 MB) | Member and observer mode only. SQLite journal size limit retained after a completed WAL reset. A pinned read transaction can temporarily exceed this value; EKV reports that checkpoint-starvation state. |
   | `:replication_batch_flush_ms` | `3` | Member and observer mode only. Max time one live LWW replication batch may stay queued per destination shard before EKV flushes it. |
-  | `:replication_batch_max_entries` | `64` | Member and observer mode only. Max live LWW replication operations EKV queues per destination shard before flushing immediately. |
-  | `:replication_batch_max_bytes` | `262_144` (256 KB) | Member and observer mode only. Max encoded byte size of one live LWW replication batch per destination shard before flushing immediately. Replication turn-taking itself is not separately configurable today. |
+  | `:replication_batch_max_entries` | `64` | Member and observer mode only. Max live LWW replication operations EKV queues per destination shard before flushing immediately. Must be at most 4,096. |
+  | `:replication_batch_max_bytes` | `262_144` (256 KB) | Member and observer mode only. Envelope-byte flush threshold for one live LWW replication batch per destination shard. Must be at most 8 MiB. A single entry may exceed a lower configured threshold, but the complete message never exceeds the hard receiver ceiling. Replication turn-taking itself is not separately configurable today. |
   | `:shutdown_barrier` | `false` | Optional graceful-shutdown barrier. Keeps EKV serving during coordinated shutdown for up to the configured timeout so members can finish final writes and replication. |
   | `:allow_stale_startup` | `false` | Member and observer mode only. Dangerous recovery override. If `true`, EKV trusts on-disk data even when stale-db detection would normally refuse startup. Intended only for explicit disaster recovery / full cold-cluster restore cases. |
   | `:tombstone_ttl` | `604_800_000` (7 days) | Member and observer mode only. How long tombstones (deleted entries) are kept before being permanently purged, in milliseconds. See "Tombstone Lifetime" below. |
@@ -532,10 +539,10 @@ defmodule EKV do
   running code**:
 
   - **Structs** — a struct is a map with a `__struct__` key pointing to a
-    module atom. If the module is renamed, removed, or its fields change,
-    deserialization will produce a bare map or a struct with missing/extra
-    keys. Prefer plain maps (e.g. `%{type: "user", name: "Alice"}`) for
-    durable storage.
+    module atom. If the module is renamed or removed, safe deserialization
+    rejects the value unless that atom still exists in the running release.
+    Field changes can also produce stale struct shapes. Prefer plain maps
+    (e.g. `%{type: "user", name: "Alice"}`) for durable storage.
 
   - **Anonymous functions** — an anonymous function captures a reference to
     the module and function clause that created it. After a code deploy, that
@@ -562,7 +569,7 @@ defmodule EKV do
   without needing to backfill every key.
   """
 
-  alias EKV.Replica
+  alias EKV.{Replica, ValueCodec, WireEnvelope}
 
   @default_local_shard_call_timeout 5_000
   @client_rpc_timeout_margin 1_000
@@ -596,6 +603,7 @@ defmodule EKV do
   This is a local read (eventually consistent, no GenServer hop).
   """
   def lookup(name, key) do
+    WireEnvelope.validate_key!(key)
     config = EKV.Supervisor.get_config(name)
 
     case mode(config) do
@@ -619,11 +627,11 @@ defmodule EKV do
             if expires_at <= now do
               nil
             else
-              {:erlang.binary_to_term(value_binary), {ts, origin}}
+              {ValueCodec.decode!(value_binary, {:lookup, key}), {ts, origin}}
             end
 
           {value_binary, ts, origin, _expires_at, nil} ->
-            {:erlang.binary_to_term(value_binary), {ts, origin}}
+            {ValueCodec.decode!(value_binary, {:lookup, key}), {ts, origin}}
         end
     end
   end
@@ -675,8 +683,12 @@ defmodule EKV do
     is the persisted origin string (normally the stable member `node_id`)
   - With `resolve_unconfirmed: true`, CAS put may also return
     `{:error, :unavailable}` if ambiguity resolution cannot complete.
+  - Consistent CAS put returns `{:error, :invalid_value}` when the value cannot
+    be encoded within EKV's persisted-value safety limits.
   """
   def put(name, key, value, opts \\ []) do
+    WireEnvelope.validate_key!(key)
+
     opts =
       Keyword.validate!(opts, [
         :ttl,
@@ -722,7 +734,7 @@ defmodule EKV do
             observer_cas_put(name, key, value, expected_vsn, opts, shard_index, timeout)
 
           {:error, false} ->
-            value_binary = :erlang.term_to_binary(value)
+            value_binary = ValueCodec.encode!(value, {:put, key})
             call_shard_write(name, shard_index, {:put, key, value_binary, opts})
         end
 
@@ -747,7 +759,7 @@ defmodule EKV do
 
           {{:ok, expected_vsn}, false} ->
             validate_cas_config!(config)
-            value_binary = :erlang.term_to_binary(value)
+            value_binary = ValueCodec.encode!(value, {:put, key})
 
             result =
               call_shard_write(
@@ -760,7 +772,7 @@ defmodule EKV do
             maybe_resolve_unconfirmed_write(result, name, key, opts, :cas_put)
 
           {:error, false} ->
-            value_binary = :erlang.term_to_binary(value)
+            value_binary = ValueCodec.encode!(value, {:put, key})
             call_shard_write(name, shard_index, {:put, key, value_binary, opts})
         end
     end
@@ -787,6 +799,7 @@ defmodule EKV do
     10_000).
   """
   def get(name, key, opts \\ []) do
+    WireEnvelope.validate_key!(key)
     opts = Keyword.validate!(opts, [:consistent, :retries, :backoff, :timeout])
     validate_retries_opt!(opts)
     validate_backoff_opt!(opts)
@@ -819,11 +832,11 @@ defmodule EKV do
               if expires_at <= now do
                 nil
               else
-                :erlang.binary_to_term(value_binary)
+                ValueCodec.decode!(value_binary, {:get, key})
               end
 
             {value_binary, _ts, _origin, _expires_at, nil} ->
-              :erlang.binary_to_term(value_binary)
+              ValueCodec.decode!(value_binary, {:get, key})
           end
         end
 
@@ -855,11 +868,11 @@ defmodule EKV do
               if expires_at <= now do
                 nil
               else
-                :erlang.binary_to_term(value_binary)
+                ValueCodec.decode!(value_binary, {:get, key})
               end
 
             {value_binary, _ts, _origin, _expires_at, nil} ->
-              :erlang.binary_to_term(value_binary)
+              ValueCodec.decode!(value_binary, {:get, key})
           end
         end
     end
@@ -903,6 +916,7 @@ defmodule EKV do
     `{:error, :unavailable}` if ambiguity resolution cannot complete.
   """
   def delete(name, key, opts \\ []) do
+    WireEnvelope.validate_key!(key)
     opts = Keyword.validate!(opts, [:if_vsn, :timeout, :resolve_unconfirmed])
     validate_timeout_opt!(opts)
     _resolve_unconfirmed? = validate_boolean_opt!(opts, :resolve_unconfirmed)
@@ -961,6 +975,8 @@ defmodule EKV do
   Returns `{:error, :unconfirmed}` when accept phase started but the caller could
   not confirm final outcome; issue `get(name, key, consistent: true)` to
   resolve.
+  Returns `{:error, :invalid_value}` when the callback result cannot be encoded
+  within EKV's persisted-value safety limits.
 
   Requires `cluster_size` config. Member mode auto-generates/persists
   `node_id` if omitted.
@@ -1008,6 +1024,7 @@ defmodule EKV do
   end
 
   defp do_update(name, key, update_callback, opts) do
+    WireEnvelope.validate_key!(key)
     opts = Keyword.validate!(opts, [:ttl, :retries, :backoff, :timeout, :resolve_unconfirmed])
     validate_ttl_opt!(opts)
     validate_retries_opt!(opts)
@@ -1414,7 +1431,7 @@ defmodule EKV do
     config = EKV.Supervisor.get_config(name)
     ensure_voter_member_mode!(config, :__observer_cas_put__)
     shard_index = Replica.shard_index_for(key, config.num_shards)
-    value_binary = :erlang.term_to_binary(value)
+    value_binary = ValueCodec.encode!(value, {:observer_cas_put, key})
     timeout = rpc_timeout_from_opts(opts)
 
     call_shard_write(
@@ -1745,7 +1762,7 @@ defmodule EKV do
         {:deleted, {ts, origin}}
 
       {value_binary, ts, origin, _expires_at, nil} ->
-        {:live, :erlang.binary_to_term(value_binary), {ts, origin}}
+        {:live, ValueCodec.decode!(value_binary, {:current_row_state, key}), {ts, origin}}
     end
   end
 
@@ -2236,7 +2253,7 @@ defmodule EKV do
   end
 
   defp decode_scan_row([key, value_binary, ts, origin_str]) do
-    {key, :erlang.binary_to_term(value_binary), {ts, origin_str}}
+    {key, ValueCodec.decode!(value_binary, {:scan, key}), {ts, origin_str}}
   end
 
   defp decode_keys_row([key, ts, origin_str]) do
