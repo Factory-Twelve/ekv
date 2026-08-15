@@ -6,6 +6,7 @@ defmodule EKV.ValueCodec do
   # Keep the encoded and wire-decompressed value ceiling aligned with the hard
   # per-message batch ceiling enforced by replication and sync receivers.
   @max_encoded_bytes WireEnvelope.max_encoded_value_bytes()
+  @max_wire_compressed_bytes WireEnvelope.max_batch_bytes()
   @max_decoded_heap_words 1024 * 1024
   @external_term_version 131
   @compressed_term_tag 80
@@ -124,7 +125,7 @@ defmodule EKV.ValueCodec do
     do: {:error, :invalid_wire_compression}
 
   def decompress_wire(compressed_binary)
-      when byte_size(compressed_binary) > @max_encoded_bytes,
+      when byte_size(compressed_binary) > @max_wire_compressed_bytes,
       do: {:error, :compressed_value_too_large}
 
   def decompress_wire(compressed_binary) do

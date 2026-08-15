@@ -476,7 +476,8 @@ defmodule EKV.WireProtocol do
                    deleted_at
                  ),
                {:ok, sized_value} <- value_for_size(wire_value),
-               {:ok, wire_bytes} <- WireEnvelope.replication_entry_size(key, sized_value),
+               {:ok, wire_bytes} <-
+                 WireEnvelope.wire_replication_entry_size(key, sized_value),
                true <- bytes + wire_bytes <= max_bytes,
                {:ok, value} <- decompress_value(wire_value),
                {:ok, expanded_bytes} <- WireEnvelope.replication_entry_size(key, value),
@@ -538,7 +539,7 @@ defmodule EKV.WireProtocol do
   defp decompress_entry({key, wire_value, timestamp, origin, expires_at, deleted_at}) do
     with {:ok, origin} <- WireEnvelope.normalize_origin(origin),
          {:ok, sized_value} <- value_for_size(wire_value),
-         {:ok, wire_bytes} <- WireEnvelope.entry_size(key, sized_value, origin),
+         {:ok, wire_bytes} <- WireEnvelope.wire_entry_size(key, sized_value, origin),
          true <- wire_bytes <= WireEnvelope.max_batch_bytes(),
          {:ok, value} <- decompress_value(wire_value),
          {:ok, expanded_bytes} <- WireEnvelope.entry_size(key, value, origin),

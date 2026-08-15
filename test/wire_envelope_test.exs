@@ -1,7 +1,7 @@
 defmodule EKV.WireEnvelopeTest do
   use ExUnit.Case, async: true
 
-  alias EKV.{WireEnvelope, WireProtocol}
+  alias EKV.{ValueCodec, WireEnvelope, WireProtocol}
 
   @max_int64 9_223_372_036_854_775_807
 
@@ -57,6 +57,63 @@ defmodule EKV.WireEnvelopeTest do
 
     assert {:ok, :erlang.external_size(normalized_progress)} ==
              WireEnvelope.progress_size(progress)
+  end
+
+  test "compressed entry sizing uses the wire limit before inflation" do
+    wire_value =
+      :binary.copy(<<0>>, WireEnvelope.max_encoded_value_bytes() + 1)
+
+    assert {:error, :value_too_large} = WireEnvelope.entry_size("key", wire_value, "origin")
+    assert {:ok, _bytes} = WireEnvelope.wire_entry_size("key", wire_value, "origin")
+
+    assert {:error, :value_too_large} =
+             WireEnvelope.replication_entry_size("key", wire_value)
+
+    assert {:ok, _bytes} =
+             WireEnvelope.wire_replication_entry_size("key", wire_value)
+  end
+
+  test "complete compressed v2 messages permit bounded compression overhead" do
+    payload = :crypto.strong_rand_bytes(ValueCodec.max_encoded_bytes() - 64)
+    value_binary = :erlang.term_to_binary(payload)
+    from_node = :remote@host
+    key = "large-value"
+    origin = "remote-voter"
+    timestamp = 1
+    sequence = 1
+    options = %{compress?: true, compression_threshold: 0}
+
+    replication =
+      {:ekv_replication_batch, from_node, 0, origin,
+       [{key, value_binary, timestamp, sequence, nil, nil}]}
+
+    assert {:ok,
+            {:ekv, 2, :replication_batch,
+             {^from_node, 0, ^origin,
+              [{^key, {:ekv_wire_compressed, compressed}, ^timestamp, ^sequence, nil, nil}]}, %{}} =
+              wire_replication} = WireProtocol.encode(replication, options)
+
+    assert byte_size(value_binary) <= ValueCodec.max_encoded_bytes()
+    assert byte_size(compressed) > ValueCodec.max_encoded_bytes()
+    assert WireEnvelope.valid_message?(wire_replication)
+
+    assert {:ok,
+            {:replication_batch, ^from_node, 0, ^origin,
+             [{^key, ^value_binary, ^timestamp, ^sequence, nil, nil}]}} =
+             WireProtocol.decode(wire_replication)
+
+    ref = make_ref()
+    ballot = System.system_time(:nanosecond)
+    entry = {key, value_binary, timestamp, origin, nil, nil}
+    accept = {:ekv_accept, ref, self(), key, ballot, origin, entry, 0}
+
+    assert {:ok, wire_accept} = WireProtocol.encode(accept, options)
+    assert WireEnvelope.valid_message?(wire_accept)
+
+    assert {:ok, {:accept, ^ref, _pid, ^key, ^ballot, ^origin, decoded_entry, 0}} =
+             WireProtocol.decode(wire_accept)
+
+    assert decoded_entry == entry
   end
 
   test "complete value-bearing messages have exact 8 MiB boundaries" do

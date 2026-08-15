@@ -98,11 +98,27 @@ defmodule EKV.WireEnvelope do
   def value_size(value) when is_binary(value), do: {:error, :value_too_large}
   def value_size(_value), do: {:error, :invalid_value}
 
+  @spec wire_value_size(term()) :: {:ok, non_neg_integer()} | {:error, error_reason()}
+  def wire_value_size(nil), do: {:ok, 0}
+
+  def wire_value_size(value) when is_binary(value) and byte_size(value) <= @max_batch_bytes,
+    do: {:ok, byte_size(value)}
+
+  def wire_value_size(value) when is_binary(value), do: {:error, :value_too_large}
+  def wire_value_size(_value), do: {:error, :invalid_value}
+
   @spec entry_size(term(), term(), term()) ::
           {:ok, non_neg_integer()} | {:error, error_reason()}
-  def entry_size(key, value, origin) do
+  def entry_size(key, value, origin), do: entry_size(key, value, origin, &value_size/1)
+
+  @spec wire_entry_size(term(), term(), term()) ::
+          {:ok, non_neg_integer()} | {:error, error_reason()}
+  def wire_entry_size(key, value, origin),
+    do: entry_size(key, value, origin, &wire_value_size/1)
+
+  defp entry_size(key, value, origin, value_size_fun) do
     with {:ok, _key_bytes} <- key_size(key),
-         {:ok, _value_bytes} <- value_size(value),
+         {:ok, _value_bytes} <- value_size_fun.(value),
          {:ok, origin} <- normalize_origin(origin) do
       {:ok, :erlang.external_size({key, value, @max_int64, origin, @max_int64, @max_int64})}
     end
@@ -110,9 +126,17 @@ defmodule EKV.WireEnvelope do
 
   @spec replication_entry_size(term(), term()) ::
           {:ok, non_neg_integer()} | {:error, error_reason()}
-  def replication_entry_size(key, value) do
+  def replication_entry_size(key, value),
+    do: replication_entry_size(key, value, &value_size/1)
+
+  @spec wire_replication_entry_size(term(), term()) ::
+          {:ok, non_neg_integer()} | {:error, error_reason()}
+  def wire_replication_entry_size(key, value),
+    do: replication_entry_size(key, value, &wire_value_size/1)
+
+  defp replication_entry_size(key, value, value_size_fun) do
     with {:ok, _key_bytes} <- key_size(key),
-         {:ok, _value_bytes} <- value_size(value) do
+         {:ok, _value_bytes} <- value_size_fun.(value) do
       {:ok, :erlang.external_size({key, value, @max_int64, @max_int64, @max_int64, @max_int64})}
     end
   end
