@@ -264,10 +264,12 @@ defmodule EKV.AdversarialVerificationTest do
       |> EKV.Store.local_progress_summary()
       |> Map.put(node(), state.local_origin_seq)
 
+    request_id = make_ref()
+
     send(
       shard_name,
       {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress_summary,
-       config.sync_chunk_size, config.sync_chunk_max_bytes, :explicit_request}
+       config.sync_chunk_size, config.sync_chunk_max_bytes, :explicit_request, request_id}
     )
 
     Process.sleep(200)
@@ -317,11 +319,12 @@ defmodule EKV.AdversarialVerificationTest do
     config = EKV.Supervisor.get_config(name)
     state = :sys.get_state(shard_name)
     my_seq = state.local_origin_seq
+    request_id = make_ref()
 
     send(
       shard_name,
       {:continue_delta_sync, fake_node, node(), 0, my_seq, config.sync_chunk_size,
-       config.sync_chunk_max_bytes}
+       config.sync_chunk_max_bytes, request_id}
     )
 
     Process.sleep(200)
@@ -329,7 +332,7 @@ defmodule EKV.AdversarialVerificationTest do
 
     :erlang.trace(Process.whereis(shard_name), false, [:send])
 
-    sync_details = collect_trace_sync_details(node())
+    sync_details = collect_trace_sync_details(state.node_id)
 
     assert Enum.any?(sync_details, fn {_count, seq} -> seq > 0 end),
            "expected at least one final delta chunk with seq>0, got #{inspect(sync_details)}"
@@ -346,7 +349,7 @@ defmodule EKV.AdversarialVerificationTest do
           {length(entries), progress_seq(progress, origin_node)} | acc
         ])
 
-      {:trace, _, :send, {:ekv, 1, :sync, {_, _, _mode, entries, progress}, _meta}, _} ->
+      {:trace, _, :send, {:ekv, 2, :sync, {_, _, _, _mode, entries, progress}, _meta}, _} ->
         collect_trace_sync_details(origin_node, [
           {length(entries), progress_seq(progress, origin_node)} | acc
         ])

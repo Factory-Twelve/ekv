@@ -73,8 +73,8 @@ defmodule EKV.Sqlite3 do
           reject_cas_managed
         )
 
-  def write_snapshot_entry(db, kv_stmt, kv_args),
-    do: Sqlite3NIF.ekv_write_snapshot_entry(db, kv_stmt, kv_args)
+  def write_snapshot_entries_batch(db, kv_stmt, kv_args_lists),
+    do: Sqlite3NIF.ekv_write_snapshot_entries_batch(db, kv_stmt, kv_args_lists)
 
   def read_entry(db, stmt, args), do: Sqlite3NIF.ekv_read_entry(db, stmt, args)
   def fetch_all(db, sql, args), do: Sqlite3NIF.ekv_fetch_all(db, sql, args)

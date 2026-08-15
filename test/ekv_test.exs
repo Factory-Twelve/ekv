@@ -27,6 +27,39 @@ defmodule EKVTest do
 
   defp local_origin_id(state), do: state.node_id || Atom.to_string(node())
 
+  defp attach_cas_test_voters(shard_name, node_ids) do
+    peers = EKV.TestCluster.start_peers(length(node_ids))
+
+    voters =
+      peers
+      |> Enum.zip(node_ids)
+      |> Map.new(fn {{_peer, remote_node}, node_id} ->
+        relay = EKV.TestCluster.start_message_relay(remote_node, self())
+        {node_id, {remote_node, relay}}
+      end)
+
+    :sys.replace_state(shard_name, fn state ->
+      %{
+        state
+        | remote_shards:
+            Map.new(voters, fn {_node_id, {remote_node, relay}} -> {remote_node, relay} end),
+          member_node_ids:
+            Map.new(voters, fn {node_id, {remote_node, _relay}} -> {remote_node, node_id} end),
+          remote_features:
+            Map.new(voters, fn {_node_id, {remote_node, _relay}} ->
+              {remote_node, MapSet.new()}
+            end)
+      }
+    end)
+
+    on_exit(fn ->
+      Enum.each(voters, fn {_node_id, {_remote_node, relay}} -> send(relay, :stop) end)
+      EKV.TestCluster.stop_peers(peers)
+    end)
+
+    Map.new(voters, fn {node_id, {_remote_node, relay}} -> {node_id, relay} end)
+  end
+
   defp auto_vacuum_mode(db) do
     {:ok, [[mode]]} = EKV.Sqlite3.fetch_all(db, "PRAGMA auto_vacuum", [])
     mode
@@ -114,7 +147,7 @@ defmodule EKVTest do
       assert :ok = EKV.put(name, "transport/key", "value")
 
       assert_receive {:ekv_test_transport_send, ^shard_pid, {^shard_name, ^remote_node},
-                      {:ekv, 1, :replication_batch, _payload, _meta}, opts}
+                      {:ekv, 2, :replication_batch, _payload, _meta}, opts}
 
       assert Keyword.fetch!(opts, :best_effort?) == true
       assert Keyword.fetch!(opts, :target_node) == remote_node
@@ -155,7 +188,7 @@ defmodule EKVTest do
       assert :ok = EKV.put(name, "transport/fail", "value")
 
       assert_receive {:ekv_test_transport_send, ^shard_pid, {^shard_name, ^remote_node},
-                      {:ekv, 1, :replication_batch, _payload, _meta}, opts}
+                      {:ekv, 2, :replication_batch, _payload, _meta}, opts}
 
       assert Keyword.fetch!(opts, :best_effort?) == true
       assert Process.alive?(shard_pid)
@@ -1563,6 +1596,116 @@ defmodule EKVTest do
   end
 
   # =====================================================================
+  # Full-sync snapshot batch storage
+  # =====================================================================
+
+  describe "full-sync snapshot batch storage" do
+    test "returns LWW flags in order without writing replay state", %{name: name} do
+      shard_name = EKV.Replica.shard_name(name, 0)
+      %{db: db, stmts: stmts} = :sys.get_state(shard_name)
+      now = System.system_time(:nanosecond)
+
+      entries = [
+        {"snapshot/batch/same", :erlang.term_to_binary("winner"), now, "remote-z", 1, nil, nil},
+        {"snapshot/batch/same", :erlang.term_to_binary("loser"), now - 1, "remote-a", 2, nil,
+         nil},
+        {"snapshot/batch/new", :erlang.term_to_binary("new"), now + 1, "remote-a", 3, nil, nil}
+      ]
+
+      assert {:ok, [true, false, true]} =
+               EKV.Store.write_snapshot_entries_batch(db, stmts.kv_upsert, entries)
+
+      assert {stored_value, ^now, "remote-z", nil, nil} =
+               EKV.Store.get(db, "snapshot/batch/same")
+
+      assert :erlang.binary_to_term(stored_value) == "winner"
+
+      assert {:ok, [["snapshot/batch/new"], ["snapshot/batch/same"]]} =
+               EKV.Sqlite3.fetch_all(
+                 db,
+                 "SELECT key FROM kv WHERE key LIKE 'snapshot/batch/%' ORDER BY key",
+                 []
+               )
+
+      assert {:ok, [[0, 0, 0]]} =
+               EKV.Sqlite3.fetch_all(
+                 db,
+                 """
+                 SELECT
+                   (SELECT COUNT(*) FROM kv_oplog),
+                   (SELECT COUNT(*) FROM kv_keyrefs),
+                   (SELECT COUNT(*) FROM kv_origin_progress)
+                 """,
+                 []
+               )
+    end
+
+    test "rolls back earlier rows on bind or step errors and leaves the statement reusable", %{
+      name: name
+    } do
+      shard_name = EKV.Replica.shard_name(name, 0)
+      %{db: db, stmts: stmts} = :sys.get_state(shard_name)
+      now = System.system_time(:nanosecond)
+
+      valid_args = [
+        "snapshot/batch/rollback-bind",
+        :erlang.term_to_binary("value"),
+        now,
+        "remote-a",
+        1,
+        nil,
+        nil
+      ]
+
+      invalid_bind_args = [
+        "snapshot/batch/invalid-bind",
+        %{not: :bindable},
+        now,
+        "remote-a",
+        2,
+        nil,
+        nil
+      ]
+
+      assert_raise ArgumentError, fn ->
+        EKV.Sqlite3.write_snapshot_entries_batch(
+          db,
+          stmts.kv_upsert,
+          [valid_args, invalid_bind_args]
+        )
+      end
+
+      assert EKV.Store.get(db, "snapshot/batch/rollback-bind") == nil
+
+      step_valid_args = [
+        "snapshot/batch/rollback-step",
+        :erlang.term_to_binary("value"),
+        now,
+        "remote-a",
+        3,
+        nil,
+        nil
+      ]
+
+      invalid_step_args = [nil, nil, now, "remote-a", 4, nil, nil]
+
+      assert {:error, _reason} =
+               EKV.Sqlite3.write_snapshot_entries_batch(
+                 db,
+                 stmts.kv_upsert,
+                 [step_valid_args, invalid_step_args]
+               )
+
+      assert EKV.Store.get(db, "snapshot/batch/rollback-step") == nil
+
+      assert {:ok, [true]} =
+               EKV.Sqlite3.write_snapshot_entries_batch(db, stmts.kv_upsert, [valid_args])
+
+      assert EKV.Store.get(db, "snapshot/batch/rollback-bind") != nil
+    end
+  end
+
+  # =====================================================================
   # Subscribe / notification tests
   # =====================================================================
 
@@ -1773,9 +1916,11 @@ defmodule EKVTest do
         {k2, :erlang.term_to_binary("v2"), now - 1000, :remote@host, 2, nil, nil}
       ]
 
+      request_id = expect_full_sync(shard_name, :remote@host)
+
       send(
         shard_name,
-        {:ekv_sync, :remote@host, 0, :full, entries, %{:remote@host => 2}}
+        {:ekv_sync, :remote@host, 0, request_id, :full, entries, %{:remote@host => 2}}
       )
 
       :sys.get_state(shard_name)
@@ -1787,9 +1932,11 @@ defmodule EKVTest do
       assert k1 in keys
       assert k2 in keys
 
+      duplicate_request_id = expect_full_sync(shard_name, :remote@host)
+
       send(
         shard_name,
-        {:ekv_sync, :remote@host, 0, :full, entries, %{:remote@host => 2}}
+        {:ekv_sync, :remote@host, 0, duplicate_request_id, :full, entries, %{:remote@host => 2}}
       )
 
       :sys.get_state(shard_name)
@@ -1822,7 +1969,8 @@ defmodule EKVTest do
         nil
       }
 
-      send(shard_name, {:ekv_sync, :relay@host, 0, :delta, [fresh_entry], %{}})
+      request_id = expect_delta_sync(shard_name, :relay@host, :remote_origin@host, 0)
+      send(shard_name, {:ekv_sync, :relay@host, 0, request_id, :delta, [fresh_entry], nil})
 
       :sys.get_state(shard_name)
       flush_dispatchers(name)
@@ -1830,7 +1978,7 @@ defmodule EKVTest do
       assert_receive {:ekv, [%EKV.Event{type: :put, key: ^key, value: "fresh"}], %{name: ^name}}
       assert EKV.get(name, key) == "fresh"
 
-      send(shard_name, {:ekv_sync, :relay@host, 0, :delta, [fresh_entry], %{}})
+      send(shard_name, {:ekv_sync, :relay@host, 0, request_id, :delta, [fresh_entry], nil})
 
       :sys.get_state(shard_name)
       flush_dispatchers(name)
@@ -1847,7 +1995,7 @@ defmodule EKVTest do
         nil
       }
 
-      send(shard_name, {:ekv_sync, :relay@host, 0, :delta, [stale_entry], %{}})
+      send(shard_name, {:ekv_sync, :relay@host, 0, request_id, :delta, [stale_entry], nil})
 
       :sys.get_state(shard_name)
       flush_dispatchers(name)
@@ -1882,9 +2030,11 @@ defmodule EKVTest do
         {k2, :erlang.term_to_binary("v2"), now - 1_000, :remote@host, 2, nil, nil}
       ]
 
+      request_id = expect_full_sync(shard_name, :remote@host)
+
       send(
         shard_name,
-        {:ekv_sync, :remote@host, 0, :full, entries, %{:remote@host => 2}}
+        {:ekv_sync, :remote@host, 0, request_id, :full, entries, %{:remote@host => 2}}
       )
 
       :sys.get_state(shard_name)
@@ -3163,6 +3313,22 @@ defmodule EKVTest do
         [
           sync_chunk_max_bytes: 0,
           expected: ":sync_chunk_max_bytes must be a positive byte count"
+        ],
+        [
+          replication_batch_max_entries: EKV.WireEnvelope.max_batch_entries() + 1,
+          expected: ":replication_batch_max_entries must be at most 4096"
+        ],
+        [
+          replication_batch_max_bytes: EKV.WireEnvelope.max_batch_bytes() + 1,
+          expected: ":replication_batch_max_bytes must be at most 8388608 bytes"
+        ],
+        [
+          sync_chunk_size: EKV.WireEnvelope.max_batch_entries() + 1,
+          expected: ":sync_chunk_size must be at most 4096"
+        ],
+        [
+          sync_chunk_max_bytes: EKV.WireEnvelope.max_batch_bytes() + 1,
+          expected: ":sync_chunk_max_bytes must be at most 8388608 bytes"
         ]
       ]
 
@@ -4011,10 +4177,10 @@ defmodule EKVTest do
     end
 
     test "with TTL expires as expected", %{cas_name: name} do
-      assert {:ok, _} = EKV.put(name, "cp/3", "val", consistent: true, ttl: 1)
+      assert {:ok, _} = EKV.put(name, "cp/3", "val", consistent: true, ttl: 50)
       assert EKV.get(name, "cp/3", consistent: true) == "val"
 
-      Process.sleep(10)
+      Process.sleep(100)
       assert EKV.get(name, "cp/3") == nil
       assert EKV.get(name, "cp/3", consistent: true) == nil
     end
@@ -4442,15 +4608,7 @@ defmodule EKVTest do
       end)
 
       shard_name = :"#{name}_ekv_replica_0"
-
-      # Inject fake members so the shard thinks alive_count = 3 (quorum = 2)
-      :sys.replace_state(shard_name, fn state ->
-        %{
-          state
-          | member_node_ids: %{:fake_b@localhost => "2", :fake_c@localhost => "3"},
-            remote_shards: %{:fake_b@localhost => self(), :fake_c@localhost => self()}
-        }
-      end)
+      voters = attach_cas_test_voters(shard_name, ["2", "3"])
 
       # Start CAS in a task (will hang waiting for remote promises)
       task =
@@ -4469,12 +4627,12 @@ defmodule EKVTest do
       # Send a fake promise from node_id "2" — shard now has 2 promises
       # (own + fake_b) which meets quorum=2. It enters accept phase.
       # BUG: local paxos_accept writes to SQLite before quorum is confirmed.
-      send(shard_name, {:ekv_promise, ref, self(), "2", 0, "", nil})
+      send(shard_name, {:ekv_promise, ref, voters["2"], "2", 0, "", nil})
       Process.sleep(50)
 
       # Send accept nacks from both fake members — quorum can't be reached
-      send(shard_name, {:ekv_accept_nack, ref, self(), "2"})
-      send(shard_name, {:ekv_accept_nack, ref, self(), "3"})
+      send(shard_name, {:ekv_accept_nack, ref, voters["2"], "2"})
+      send(shard_name, {:ekv_accept_nack, ref, voters["3"], "3"})
 
       # CAS entered accept phase and then lost quorum, so caller sees unconfirmed.
       result = Task.await(task, 12_000)
@@ -4509,14 +4667,7 @@ defmodule EKVTest do
       end)
 
       shard_name = :"#{name}_ekv_replica_0"
-
-      :sys.replace_state(shard_name, fn state ->
-        %{
-          state
-          | member_node_ids: %{:fake_b@localhost => "2", :fake_c@localhost => "3"},
-            remote_shards: %{:fake_b@localhost => self(), :fake_c@localhost => self()}
-        }
-      end)
+      voters = attach_cas_test_voters(shard_name, ["2", "3"])
 
       task =
         Task.async(fn ->
@@ -4528,10 +4679,10 @@ defmodule EKVTest do
       assert map_size(shard_state.pending_cas) == 1
       [{ref, _op}] = Map.to_list(shard_state.pending_cas)
 
-      send(shard_name, {:ekv_promise, ref, self(), "2", 0, "", nil})
+      send(shard_name, {:ekv_promise, ref, voters["2"], "2", 0, "", nil})
       Process.sleep(50)
-      send(shard_name, {:ekv_accept_nack, ref, self(), "2"})
-      send(shard_name, {:ekv_accept_nack, ref, self(), "3"})
+      send(shard_name, {:ekv_accept_nack, ref, voters["2"], "2"})
+      send(shard_name, {:ekv_accept_nack, ref, voters["3"], "3"})
 
       result = Task.await(task, 12_000)
 
@@ -4563,15 +4714,7 @@ defmodule EKVTest do
       end)
 
       shard_name = :"#{name}_ekv_replica_0"
-
-      # Inject fake members
-      :sys.replace_state(shard_name, fn state ->
-        %{
-          state
-          | member_node_ids: %{:fake_b@localhost => "2", :fake_c@localhost => "3"},
-            remote_shards: %{:fake_b@localhost => self(), :fake_c@localhost => self()}
-        }
-      end)
+      voters = attach_cas_test_voters(shard_name, ["2", "3"])
 
       # Start CAS
       task =
@@ -4585,11 +4728,11 @@ defmodule EKVTest do
       [{ref, _op}] = Map.to_list(shard_state.pending_cas)
 
       # Send promise → quorum → accept phase
-      send(shard_name, {:ekv_promise, ref, self(), "2", 0, "", nil})
+      send(shard_name, {:ekv_promise, ref, voters["2"], "2", 0, "", nil})
       Process.sleep(50)
 
       # Send accepted from node_id "2" → quorum of accepts reached
-      send(shard_name, {:ekv_accepted, ref, self(), "2"})
+      send(shard_name, {:ekv_accepted, ref, voters["2"], "2"})
 
       result = Task.await(task, 10_000)
       assert match?({:ok, _}, result)
@@ -4873,57 +5016,54 @@ defmodule EKVTest do
       end)
 
       shard_name = :"#{name}_ekv_replica_0"
+      voters = attach_cas_test_voters(shard_name, ["2", "3"])
 
-      # Inject fake members via :sys.replace_state so the shard thinks it has remote nodes.
-      # We use self() as a fake pid — messages come back to the test process.
-      fake_node_a = :"fake_a@127.0.0.1"
-      fake_node_b = :"fake_b@127.0.0.1"
-
-      :sys.replace_state(shard_name, fn state ->
-        %{
-          state
-          | remote_shards: %{fake_node_a => self(), fake_node_b => self()},
-            member_node_ids: %{fake_node_a => "2", fake_node_b => "3"}
-        }
-      end)
-
-      %{name: name, shard_name: shard_name}
+      %{name: name, shard_name: shard_name, voters: voters}
     end
 
-    test "acceptor accept does NOT write to kv", %{name: name, shard_name: shard_name} do
+    test "acceptor accept does NOT write to kv", %{
+      name: name,
+      shard_name: shard_name,
+      voters: voters
+    } do
       key = "phantom/1"
       ref = make_ref()
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
       val_bin = :erlang.term_to_binary("phantom_val")
       entry_tuple = {key, val_bin, now, origin_str, nil, nil}
 
-      send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry_tuple, 0})
+      send(shard_name, {:ekv_accept, ref, voters["2"], key, 100, "2", entry_tuple, 0})
 
       # Should get accepted back
-      assert_receive {:ekv, 1, :accepted, {^ref, _, _}, %{}}, 1000
+      assert_receive {:ekv, 2, :accepted, {^ref, _, _}, %{}}, 1000
 
       # Value should NOT be in kv (only in kv_paxos)
       assert EKV.get(name, key) == nil
     end
 
-    test "compressed accept does NOT write to kv", %{name: name, shard_name: shard_name} do
+    test "compressed accept does NOT write to kv", %{
+      name: name,
+      shard_name: shard_name,
+      voters: voters
+    } do
       key = "phantom/compressed_accept"
       ref = make_ref()
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
       val_bin = :erlang.term_to_binary("compressed_phantom")
       entry_tuple = {key, wire_compress(val_bin), now, origin_str, nil, nil}
 
-      send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry_tuple, 0})
+      send(shard_name, {:ekv_accept, ref, voters["2"], key, 100, "2", entry_tuple, 0})
 
-      assert_receive {:ekv, 1, :accepted, {^ref, _, _}, %{}}, 1000
+      assert_receive {:ekv, 2, :accepted, {^ref, _, _}, %{}}, 1000
       assert EKV.get(name, key) == nil
     end
 
     test "acceptor accept does NOT dispatch subscriber events", %{
       name: name,
-      shard_name: shard_name
+      shard_name: shard_name,
+      voters: voters
     } do
       :ok = EKV.subscribe(name, "phantom/")
       Process.sleep(50)
@@ -4931,56 +5071,72 @@ defmodule EKVTest do
       key = "phantom/2"
       ref = make_ref()
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
       val_bin = :erlang.term_to_binary("no_event")
       entry_tuple = {key, val_bin, now, origin_str, nil, nil}
 
-      send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry_tuple, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref, voters["2"], key, 100, "2", entry_tuple, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref, _, _}, %{}}, 1000
 
       flush_dispatchers(name)
       refute_receive {:ekv, _, _}, 200
     end
 
-    test "promote after commit writes to kv", %{name: name, shard_name: shard_name} do
+    test "promote after commit writes to kv", %{
+      name: name,
+      shard_name: shard_name,
+      voters: voters
+    } do
       key = "phantom/3"
       ref = make_ref()
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
       val_bin = :erlang.term_to_binary("promoted")
       entry_tuple = {key, val_bin, now, origin_str, nil, nil}
 
       # Accept
-      send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry_tuple, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref, voters["2"], key, 100, "2", entry_tuple, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref, _, _}, %{}}, 1000
       assert EKV.get(name, key) == nil
 
       # Commit notification → promote
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["2"], key, 100, "2", nil, 0, "2", 0}
+      )
+
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == "promoted"
     end
 
-    test "promote dispatches subscriber events", %{name: name, shard_name: shard_name} do
+    test "promote dispatches subscriber events", %{
+      name: name,
+      shard_name: shard_name,
+      voters: voters
+    } do
       :ok = EKV.subscribe(name, "phantom/")
       Process.sleep(50)
 
       key = "phantom/4"
       ref = make_ref()
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
       val_bin = :erlang.term_to_binary("event_val")
       entry_tuple = {key, val_bin, now, origin_str, nil, nil}
 
       # Accept — no event
-      send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry_tuple, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref, voters["2"], key, 100, "2", entry_tuple, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref, _, _}, %{}}, 1000
       flush_dispatchers(name)
       refute_receive {:ekv, _, _}, 100
 
       # Commit — event dispatched
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["2"], key, 100, "2", nil, 0, "2", 0}
+      )
+
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -4989,18 +5145,23 @@ defmodule EKVTest do
 
     test "commit payload can promote without prior local accept", %{
       name: name,
-      shard_name: shard_name
+      shard_name: shard_name,
+      voters: voters
     } do
       :ok = EKV.subscribe(name, "phantom/")
       Process.sleep(50)
 
       key = "phantom/commit_payload_put"
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
       val_bin = :erlang.term_to_binary("payload_put")
       entry_tuple = {key, val_bin, now, origin_str, nil, nil}
 
-      send(shard_name, {:ekv_cas_committed, key, 150, "2", entry_tuple, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["2"], key, 150, "2", entry_tuple, 0, "2", 0}
+      )
+
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -5010,18 +5171,23 @@ defmodule EKVTest do
 
     test "compressed commit payload can promote without prior local accept", %{
       name: name,
-      shard_name: shard_name
+      shard_name: shard_name,
+      voters: voters
     } do
       :ok = EKV.subscribe(name, "phantom/")
       Process.sleep(50)
 
       key = "phantom/compressed_commit_payload_put"
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
       val_bin = :erlang.term_to_binary("payload_put_compressed")
       entry_tuple = {key, wire_compress(val_bin), now, origin_str, nil, nil}
 
-      send(shard_name, {:ekv_cas_committed, key, 151, "2", entry_tuple, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["2"], key, 151, "2", entry_tuple, 0, "2", 0}
+      )
+
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -5034,7 +5200,8 @@ defmodule EKVTest do
 
     test "commit payload delete can promote without prior local accept", %{
       name: name,
-      shard_name: shard_name
+      shard_name: shard_name,
+      voters: voters
     } do
       key = "phantom/commit_payload_del"
       :ok = EKV.put(name, key, "payload_old")
@@ -5051,10 +5218,14 @@ defmodule EKVTest do
       end
 
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "3"
       entry_tuple = {key, nil, now, origin_str, nil, now}
 
-      send(shard_name, {:ekv_cas_committed, key, 250, "3", entry_tuple, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["3"], key, 250, "3", entry_tuple, 0, "3", 0}
+      )
+
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -5062,27 +5233,35 @@ defmodule EKVTest do
       assert EKV.get(name, key) == nil
     end
 
-    test "promote with stale ballot is ignored", %{name: name, shard_name: shard_name} do
+    test "promote with stale ballot is ignored", %{
+      name: name,
+      shard_name: shard_name,
+      voters: voters
+    } do
       key = "phantom/5"
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
 
       # Accept with ballot {100, "2"}
       ref1 = make_ref()
       val1 = :erlang.term_to_binary("v1")
       entry1 = {key, val1, now, origin_str, nil, nil}
-      send(shard_name, {:ekv_accept, ref1, self(), key, 100, "2", entry1, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref1, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref1, voters["2"], key, 100, "2", entry1, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref1, _, _}, %{}}, 1000
 
       # Accept with higher ballot {200, "3"} — overwrites kv_paxos
       ref2 = make_ref()
       val2 = :erlang.term_to_binary("v2")
-      entry2 = {key, val2, now + 1, origin_str, nil, nil}
-      send(shard_name, {:ekv_accept, ref2, self(), key, 200, "3", entry2, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref2, _, _}, %{}}, 1000
+      entry2 = {key, val2, now + 1, "3", nil, nil}
+      send(shard_name, {:ekv_accept, ref2, voters["3"], key, 200, "3", entry2, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref2, _, _}, %{}}, 1000
 
       # Stale commit for ballot {100, "2"} — should be ignored
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["2"], key, 100, "2", nil, 0, "2", 0}
+      )
+
       :sys.get_state(shard_name)
 
       # Neither value promoted to kv
@@ -5091,21 +5270,26 @@ defmodule EKVTest do
 
     test "promote clears kv_paxos value columns (no storage doubling)", %{
       name: name,
-      shard_name: shard_name
+      shard_name: shard_name,
+      voters: voters
     } do
       key = "phantom/6"
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
       val_bin = :erlang.term_to_binary("clear_test")
       entry = {key, val_bin, now, origin_str, nil, nil}
 
       # Accept
       ref = make_ref()
-      send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref, voters["2"], key, 100, "2", entry, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref, _, _}, %{}}, 1000
 
       # Commit → promote
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["2"], key, 100, "2", nil, 0, "2", 0}
+      )
+
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == "clear_test"
@@ -5118,7 +5302,8 @@ defmodule EKVTest do
 
     test "prepare reads from kv_paxos when accepted (tentative value)", %{
       name: name,
-      shard_name: shard_name
+      shard_name: shard_name,
+      voters: voters
     } do
       key = "phantom/7"
 
@@ -5129,13 +5314,13 @@ defmodule EKVTest do
       # Send paxos_accept with ballot {100, "2"} and value "v2"
       # kv_paxos has "v2", kv has "v1"
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
       val_bin = :erlang.term_to_binary("v2")
       entry = {key, val_bin, now, origin_str, nil, nil}
 
       ref = make_ref()
-      send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref, voters["2"], key, 100, "2", entry, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref, _, _}, %{}}, 1000
 
       # kv still has "v1"
       assert EKV.get(name, key) == "v1"
@@ -5169,7 +5354,8 @@ defmodule EKVTest do
 
     test "CAS delete promote delivers previous value in event", %{
       name: name,
-      shard_name: shard_name
+      shard_name: shard_name,
+      voters: voters
     } do
       key = "phantom/10"
 
@@ -5191,18 +5377,22 @@ defmodule EKVTest do
 
       # Accept a delete (tombstone)
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
       entry = {key, nil, now, origin_str, nil, now}
 
       ref = make_ref()
-      send(shard_name, {:ekv_accept, ref, self(), key, 200, "2", entry, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref, voters["2"], key, 200, "2", entry, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref, _, _}, %{}}, 1000
 
       # kv still has "v1" (delete not committed yet)
       assert EKV.get(name, key) == "v1"
 
       # Commit → promote writes tombstone to kv
-      send(shard_name, {:ekv_cas_committed, key, 200, "2", nil, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["2"], key, 200, "2", nil, 0, "2", 0}
+      )
+
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -5357,10 +5547,12 @@ defmodule EKVTest do
         |> EKV.Store.local_progress_summary()
         |> Map.put(local_origin_id(state), state.local_origin_seq)
 
+      request_id = make_ref()
+
       send(
         shard_name,
         {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
-         config.sync_chunk_max_bytes, :explicit_request}
+         config.sync_chunk_max_bytes, :explicit_request, request_id}
       )
 
       Process.sleep(200)
@@ -5391,12 +5583,13 @@ defmodule EKVTest do
       config = EKV.Supervisor.get_config(name)
       state = :sys.get_state(shard_name)
       my_seq = state.local_origin_seq
+      request_id = make_ref()
 
       # Trigger delta sync starting from seq 0
       send(
         shard_name,
         {:continue_delta_sync, fake_node, local_origin_id(state), 0, my_seq,
-         config.sync_chunk_size, config.sync_chunk_max_bytes}
+         config.sync_chunk_size, config.sync_chunk_max_bytes, request_id}
       )
 
       Process.sleep(200)
@@ -5436,10 +5629,12 @@ defmodule EKVTest do
         |> EKV.Store.local_progress_summary()
         |> Map.put(local_origin_id(state), state.local_origin_seq)
 
+      request_id = make_ref()
+
       send(
         shard_name,
         {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
-         150, :explicit_request}
+         150, :explicit_request, request_id}
       )
 
       Process.sleep(200)
@@ -5484,11 +5679,12 @@ defmodule EKVTest do
       config = EKV.Supervisor.get_config(name)
       state = :sys.get_state(shard_name)
       my_seq = state.local_origin_seq
+      request_id = make_ref()
 
       send(
         shard_name,
         {:continue_delta_sync, fake_node, local_origin_id(state), 0, my_seq,
-         config.sync_chunk_size, 150}
+         config.sync_chunk_size, 150, request_id}
       )
 
       Process.sleep(200)
@@ -5535,13 +5731,15 @@ defmodule EKVTest do
         |> EKV.Store.local_progress_summary()
         |> Map.put(local_origin_id(state), state.local_origin_seq)
 
+      request_id = make_ref()
+
       # Suspend the shard, inject the first continue message, then remove the member
       :sys.suspend(shard_name)
 
       send(
         shard_name,
         {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
-         config.sync_chunk_max_bytes, :explicit_request}
+         config.sync_chunk_max_bytes, :explicit_request, request_id}
       )
 
       # Resume to process just the first chunk (sends chunk + queues next continuation)
@@ -5592,13 +5790,15 @@ defmodule EKVTest do
         |> EKV.Store.local_progress_summary()
         |> Map.put(local_origin_id(state), state.local_origin_seq)
 
+      request_id = make_ref()
+
       # Suspend, inject first chunk trigger, resume
       :sys.suspend(shard_name)
 
       send(
         shard_name,
         {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
-         config.sync_chunk_max_bytes, :explicit_request}
+         config.sync_chunk_max_bytes, :explicit_request, request_id}
       )
 
       :sys.resume(shard_name)
@@ -5642,10 +5842,12 @@ defmodule EKVTest do
         |> EKV.Store.local_progress_summary()
         |> Map.put(local_origin_id(state), state.local_origin_seq)
 
+      request_id = make_ref()
+
       send(
         shard_name,
         {:continue_full_sync, fake_node, nil, tombstone_cutoff, progress, config.sync_chunk_size,
-         config.sync_chunk_max_bytes, :explicit_request}
+         config.sync_chunk_max_bytes, :explicit_request, request_id}
       )
 
       Process.sleep(200)
@@ -5699,70 +5901,76 @@ defmodule EKVTest do
       end)
 
       shard_name = :"#{name}_ekv_replica_0"
+      voters = attach_cas_test_voters(shard_name, ["2", "3"])
 
-      # Inject fake members
-      fake_node_a = :"order_a@127.0.0.1"
-      fake_node_b = :"order_b@127.0.0.1"
-
-      :sys.replace_state(shard_name, fn state ->
-        %{
-          state
-          | remote_shards: %{fake_node_a => self(), fake_node_b => self()},
-            member_node_ids: %{fake_node_a => "2", fake_node_b => "3"}
-        }
-      end)
-
-      %{name: name, data_dir: data_dir, shard_name: shard_name}
+      %{name: name, data_dir: data_dir, shard_name: shard_name, voters: voters}
     end
 
-    test "stale commit after higher-ballot accept", %{name: name, shard_name: shard_name} do
+    test "stale commit after higher-ballot accept", %{
+      name: name,
+      shard_name: shard_name,
+      voters: voters
+    } do
       key = "order/stale_commit"
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
 
       # Accept with ballot {100, "2"}
       ref1 = make_ref()
       val1 = :erlang.term_to_binary("v1")
       entry1 = {key, val1, now, origin_str, nil, nil}
-      send(shard_name, {:ekv_accept, ref1, self(), key, 100, "2", entry1, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref1, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref1, voters["2"], key, 100, "2", entry1, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref1, _, _}, %{}}, 1000
 
       # Accept with higher ballot {200, "3"} — overwrites kv_paxos
       ref2 = make_ref()
       val2 = :erlang.term_to_binary("v2")
-      entry2 = {key, val2, now + 1, origin_str, nil, nil}
-      send(shard_name, {:ekv_accept, ref2, self(), key, 200, "3", entry2, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref2, _, _}, %{}}, 1000
+      entry2 = {key, val2, now + 1, "3", nil, nil}
+      send(shard_name, {:ekv_accept, ref2, voters["3"], key, 200, "3", entry2, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref2, _, _}, %{}}, 1000
 
       # Stale commit for ballot {100, "2"} — should return :stale, value NOT in kv
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["2"], key, 100, "2", nil, 0, "2", 0}
+      )
+
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == nil
 
       # Commit for ballot {200, "3"} — should succeed
-      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["3"], key, 200, "3", nil, 0, "3", 0}
+      )
+
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "v2"
     end
 
-    test "duplicate commit notification", %{name: name, shard_name: shard_name} do
+    test "duplicate commit notification", %{
+      name: name,
+      shard_name: shard_name,
+      voters: voters
+    } do
       key = "order/dup_commit"
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
 
       # Accept
       ref = make_ref()
       val = :erlang.term_to_binary("dup_val")
       entry = {key, val, now, origin_str, nil, nil}
-      send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref, voters["2"], key, 100, "2", entry, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref, _, _}, %{}}, 1000
 
       # Subscribe to verify commit notifications
       :ok = EKV.subscribe(name, "order/")
       Process.sleep(50)
 
       # First commit — succeeds
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      commit = {:ekv_cas_committed, voters["2"], key, 100, "2", nil, 0, "2", 0}
+      send(shard_name, commit)
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -5770,7 +5978,7 @@ defmodule EKVTest do
       assert_receive {:ekv, [%EKV.Event{type: :put, key: ^key, value: "dup_val"}], _}, 1000
 
       # Second commit (duplicate) replays the same promoted value/event.
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(shard_name, commit)
       :sys.get_state(shard_name)
       flush_dispatchers(name)
 
@@ -5806,32 +6014,37 @@ defmodule EKVTest do
     end
 
     test "accept at acceptor after proposer timed out (prepare superseded)", %{
-      shard_name: shard_name
+      shard_name: shard_name,
+      voters: voters
     } do
       key = "order/superseded_accept"
 
       # Send prepare with ballot=100 (accepted by local shard)
       ref1 = make_ref()
-      send(shard_name, {:ekv_prepare, ref1, self(), key, 100, "2", 0})
-      assert_receive {:ekv, 1, :promise, {^ref1, _, _, _, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_prepare, ref1, voters["2"], key, 100, "2", 0})
+      assert_receive {:ekv, 2, :promise, {^ref1, _, _, _, _, _}, %{}}, 1000
 
       # Send prepare with higher ballot=200 (supersedes ballot=100)
       ref2 = make_ref()
-      send(shard_name, {:ekv_prepare, ref2, self(), key, 200, "3", 0})
-      assert_receive {:ekv, 1, :promise, {^ref2, _, _, _, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_prepare, ref2, voters["3"], key, 200, "3", 0})
+      assert_receive {:ekv, 2, :promise, {^ref2, _, _, _, _, _}, %{}}, 1000
 
       # Now send accept for the old ballot=100 — should be rejected
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
       val = :erlang.term_to_binary("stale")
       entry = {key, val, now, origin_str, nil, nil}
 
       ref3 = make_ref()
-      send(shard_name, {:ekv_accept, ref3, self(), key, 100, "2", entry, 0})
-      assert_receive {:ekv, 1, :accept_nack, {^ref3, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref3, voters["2"], key, 100, "2", entry, 0})
+      assert_receive {:ekv, 2, :accept_nack, {^ref3, _, _}, %{}}, 1000
     end
 
-    test "interleaved CAS from two proposers on same key", %{name: name, shard_name: shard_name} do
+    test "interleaved CAS from two proposers on same key", %{
+      name: name,
+      shard_name: shard_name,
+      voters: voters
+    } do
       key = "order/interleaved_cas"
 
       # Write initial value
@@ -5839,49 +6052,57 @@ defmodule EKVTest do
 
       # Proposer A prepares with ballot 100 — gets promise from local shard
       ref_a = make_ref()
-      send(shard_name, {:ekv_prepare, ref_a, self(), key, 100, "2", 0})
-      assert_receive {:ekv, 1, :promise, {^ref_a, _, _, _, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_prepare, ref_a, voters["2"], key, 100, "2", 0})
+      assert_receive {:ekv, 2, :promise, {^ref_a, _, _, _, _, _}, %{}}, 1000
 
       # Simulate member 2 promise for A (quorum: need 2 out of 3)
       # We respond on behalf of fake node
 
       # Proposer B prepares with higher ballot 200 — preempts A
       ref_b = make_ref()
-      send(shard_name, {:ekv_prepare, ref_b, self(), key, 200, "3", 0})
-      assert_receive {:ekv, 1, :promise, {^ref_b, _, _, _, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_prepare, ref_b, voters["3"], key, 200, "3", 0})
+      assert_receive {:ekv, 2, :promise, {^ref_b, _, _, _, _, _}, %{}}, 1000
 
       # Now A tries to accept with ballot 100 — should be rejected (promised 200)
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
       val_a = :erlang.term_to_binary("from_a")
       entry_a = {key, val_a, now, origin_str, nil, nil}
 
       ref_accept_a = make_ref()
-      send(shard_name, {:ekv_accept, ref_accept_a, self(), key, 100, "2", entry_a, 0})
-      assert_receive {:ekv, 1, :accept_nack, {^ref_accept_a, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref_accept_a, voters["2"], key, 100, "2", entry_a, 0})
+      assert_receive {:ekv, 2, :accept_nack, {^ref_accept_a, _, _}, %{}}, 1000
 
       # B's accept should succeed
       val_b = :erlang.term_to_binary("from_b")
-      entry_b = {key, val_b, now + 1, origin_str, nil, nil}
+      entry_b = {key, val_b, now + 1, "3", nil, nil}
 
       ref_accept_b = make_ref()
-      send(shard_name, {:ekv_accept, ref_accept_b, self(), key, 200, "3", entry_b, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref_accept_b, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref_accept_b, voters["3"], key, 200, "3", entry_b, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref_accept_b, _, _}, %{}}, 1000
 
       # B commits
-      send(shard_name, {:ekv_cas_committed, key, 200, "3", nil, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["3"], key, 200, "3", nil, 0, "3", 0}
+      )
+
       :sys.get_state(shard_name)
       assert EKV.get(name, key) == "from_b"
     end
 
-    test "sync message interleaved with CAS prepare", %{name: name, shard_name: shard_name} do
+    test "sync message interleaved with CAS prepare", %{
+      name: name,
+      shard_name: shard_name,
+      voters: voters
+    } do
       key = "order/sync_during_cas"
       sync_key = "order/sync_other"
 
       # Start CAS — prepare locally
       ref = make_ref()
-      send(shard_name, {:ekv_prepare, ref, self(), key, 100, "2", 0})
-      assert_receive {:ekv, 1, :promise, {^ref, _, _, _, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_prepare, ref, voters["2"], key, 100, "2", 0})
+      assert_receive {:ekv, 2, :promise, {^ref, _, _, _, _, _}, %{}}, 1000
 
       # While CAS is "in progress" (waiting for member promises), deliver a sync message
       # with a DIFFERENT key — should process normally
@@ -5890,7 +6111,13 @@ defmodule EKVTest do
       val_binary = :erlang.term_to_binary("synced_val")
 
       sync_entries = [{sync_key, val_binary, now, origin, 1, nil, nil}]
-      send(shard_name, {:ekv_sync, :some_node@host, 0, :delta, sync_entries, %{origin => 1}})
+      request_id = expect_delta_sync(shard_name, :some_node@host, origin, 0)
+
+      send(
+        shard_name,
+        {:ekv_sync, :some_node@host, 0, request_id, :delta, sync_entries, %{origin => 1}}
+      )
+
       :sys.get_state(shard_name)
 
       # Synced key should be available
@@ -5901,13 +6128,17 @@ defmodule EKVTest do
 
       # Accept and commit CAS normally
       val = :erlang.term_to_binary("cas_val")
-      entry = {key, val, now + 1, Atom.to_string(node()), nil, nil}
+      entry = {key, val, now + 1, "2", nil, nil}
 
       ref_accept = make_ref()
-      send(shard_name, {:ekv_accept, ref_accept, self(), key, 100, "2", entry, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref_accept, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref_accept, voters["2"], key, 100, "2", entry, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref_accept, _, _}, %{}}, 1000
 
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["2"], key, 100, "2", nil, 0, "2", 0}
+      )
+
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == "cas_val"
@@ -5915,7 +6146,8 @@ defmodule EKVTest do
 
     test "delta sync chunk on same key before final settlement does not derail CAS", %{
       name: name,
-      shard_name: shard_name
+      shard_name: shard_name,
+      voters: voters
     } do
       key = "order/delta_same_key_cas"
       sync_origin = :"delta_origin@127.0.0.1"
@@ -5924,10 +6156,12 @@ defmodule EKVTest do
       sync_val_bin = :erlang.term_to_binary(sync_val)
       sync_origin_str = Atom.to_string(sync_origin)
 
+      request_id = expect_delta_sync(shard_name, sync_origin, sync_origin, 0)
+
       send(
         shard_name,
-        {:ekv_sync, sync_origin, 0, :delta,
-         [{key, sync_val_bin, sync_ts, sync_origin, 1, nil, nil}], %{}}
+        {:ekv_sync, sync_origin, 0, request_id, :delta,
+         [{key, sync_val_bin, sync_ts, sync_origin, 1, nil, nil}], nil}
       )
 
       :sys.get_state(shard_name)
@@ -5935,23 +6169,31 @@ defmodule EKVTest do
       assert EKV.get(name, key) == sync_val
 
       ref = make_ref()
-      send(shard_name, {:ekv_prepare, ref, self(), key, 100, "2", 0})
+      send(shard_name, {:ekv_prepare, ref, voters["2"], key, 100, "2", 0})
 
-      assert_receive {:ekv, 1, :promise, {^ref, _, _, 0, "", kv_row}, %{}}, 1000
+      assert_receive {:ekv, 2, :promise, {^ref, _, _, 0, "", kv_row}, %{}}, 1000
       assert kv_row == [sync_val_bin, sync_ts, sync_origin_str, nil, nil]
 
       cas_val = "cas_after_delta"
       cas_val_bin = :erlang.term_to_binary(cas_val)
-      cas_entry = {key, cas_val_bin, sync_ts + 1, Atom.to_string(node()), nil, nil}
+      cas_entry = {key, cas_val_bin, sync_ts + 1, "2", nil, nil}
       ref_accept = make_ref()
 
-      send(shard_name, {:ekv_accept, ref_accept, self(), key, 100, "2", cas_entry, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref_accept, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref_accept, voters["2"], key, 100, "2", cas_entry, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref_accept, _, _}, %{}}, 1000
 
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["2"], key, 100, "2", nil, 0, "2", 0}
+      )
+
       :sys.get_state(shard_name)
 
-      send(shard_name, {:ekv_sync, sync_origin, 0, :delta, [], %{sync_origin => 1}})
+      send(
+        shard_name,
+        {:ekv_sync, sync_origin, 0, request_id, :delta, [], %{sync_origin => 1}}
+      )
+
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == cas_val
@@ -5959,7 +6201,8 @@ defmodule EKVTest do
 
     test "full sync chunk on same key before final settlement does not derail CAS", %{
       name: name,
-      shard_name: shard_name
+      shard_name: shard_name,
+      voters: voters
     } do
       key = "order/full_same_key_cas"
       sync_origin = :"full_origin@127.0.0.1"
@@ -5967,11 +6210,12 @@ defmodule EKVTest do
       sync_val = "full_seen"
       sync_val_bin = :erlang.term_to_binary(sync_val)
       sync_origin_str = Atom.to_string(sync_origin)
+      request_id = expect_full_sync(shard_name, sync_origin)
 
       send(
         shard_name,
-        {:ekv_sync, sync_origin, 0, :full,
-         [{key, sync_val_bin, sync_ts, sync_origin, 1, nil, nil}], %{}}
+        {:ekv_sync, sync_origin, 0, request_id, :full,
+         [{key, sync_val_bin, sync_ts, sync_origin, 1, nil, nil}], nil}
       )
 
       :sys.get_state(shard_name)
@@ -5979,23 +6223,31 @@ defmodule EKVTest do
       assert EKV.get(name, key) == sync_val
 
       ref = make_ref()
-      send(shard_name, {:ekv_prepare, ref, self(), key, 100, "2", 0})
+      send(shard_name, {:ekv_prepare, ref, voters["2"], key, 100, "2", 0})
 
-      assert_receive {:ekv, 1, :promise, {^ref, _, _, 0, "", kv_row}, %{}}, 1000
+      assert_receive {:ekv, 2, :promise, {^ref, _, _, 0, "", kv_row}, %{}}, 1000
       assert kv_row == [sync_val_bin, sync_ts, sync_origin_str, nil, nil]
 
       cas_val = "cas_after_full"
       cas_val_bin = :erlang.term_to_binary(cas_val)
-      cas_entry = {key, cas_val_bin, sync_ts + 1, Atom.to_string(node()), nil, nil}
+      cas_entry = {key, cas_val_bin, sync_ts + 1, "2", nil, nil}
       ref_accept = make_ref()
 
-      send(shard_name, {:ekv_accept, ref_accept, self(), key, 100, "2", cas_entry, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref_accept, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref_accept, voters["2"], key, 100, "2", cas_entry, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref_accept, _, _}, %{}}, 1000
 
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["2"], key, 100, "2", nil, 0, "2", 0}
+      )
+
       :sys.get_state(shard_name)
 
-      send(shard_name, {:ekv_sync, sync_origin, 0, :full, [], %{sync_origin => 1}})
+      send(
+        shard_name,
+        {:ekv_sync, sync_origin, 0, request_id, :full, [], %{sync_origin => 1}}
+      )
+
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == cas_val
@@ -6003,18 +6255,19 @@ defmodule EKVTest do
 
     test "commit notification to shard that restarted (kv_paxos survives)", %{
       name: name,
-      shard_name: shard_name
+      shard_name: shard_name,
+      voters: voters
     } do
       key = "order/restart_commit"
       now = System.system_time(:nanosecond)
-      origin_str = Atom.to_string(node())
+      origin_str = "2"
       val_bin = :erlang.term_to_binary("survive_restart")
       entry = {key, val_bin, now, origin_str, nil, nil}
 
       # Accept (writes to kv_paxos in SQLite)
       ref = make_ref()
-      send(shard_name, {:ekv_accept, ref, self(), key, 100, "2", entry, 0})
-      assert_receive {:ekv, 1, :accepted, {^ref, _, _}, %{}}, 1000
+      send(shard_name, {:ekv_accept, ref, voters["2"], key, 100, "2", entry, 0})
+      assert_receive {:ekv, 2, :accepted, {^ref, _, _}, %{}}, 1000
 
       # kv_paxos is written, value not in kv yet
       assert EKV.get(name, key) == nil
@@ -6026,17 +6279,22 @@ defmodule EKVTest do
       # Shard should be back (supervisor restarts it)
       assert Process.whereis(shard_name) != nil
 
-      # Re-inject fake members so the shard thinks it has remotes
+      # Restore the authenticated test voters after supervised restart.
       :sys.replace_state(shard_name, fn state ->
         %{
           state
-          | remote_shards: %{:"order_a@127.0.0.1" => self(), :"order_b@127.0.0.1" => self()},
-            member_node_ids: %{:"order_a@127.0.0.1" => "2", :"order_b@127.0.0.1" => "3"}
+          | remote_shards: Map.new(voters, fn {_id, pid} -> {node(pid), pid} end),
+            member_node_ids: Map.new(voters, fn {id, pid} -> {node(pid), id} end),
+            remote_features: Map.new(voters, fn {_id, pid} -> {node(pid), MapSet.new()} end)
         }
       end)
 
       # Send commit notification — kv_paxos should still have the accepted value
-      send(shard_name, {:ekv_cas_committed, key, 100, "2", nil, 0, node(), 0})
+      send(
+        shard_name,
+        {:ekv_cas_committed, voters["2"], key, 100, "2", nil, 0, "2", 0}
+      )
+
       :sys.get_state(shard_name)
 
       assert EKV.get(name, key) == "survive_restart"
@@ -6091,10 +6349,10 @@ defmodule EKVTest do
 
   defp count_trace_sync_messages(count) do
     receive do
-      {:trace, _, :send, {:ekv_sync, _, _, _, _, _}, _} ->
+      {:trace, _, :send, {:ekv_sync, _, _, _, _, _, _}, _} ->
         count_trace_sync_messages(count + 1)
 
-      {:trace, _, :send, {:ekv, 1, :sync, {_, _, _, _, _}, _meta}, _} ->
+      {:trace, _, :send, {:ekv, 2, :sync, {_, _, _, _, _, _}, _meta}, _} ->
         count_trace_sync_messages(count + 1)
 
       {:trace, _, :send, _, _} ->
@@ -6110,10 +6368,11 @@ defmodule EKVTest do
 
   defp collect_trace_sync_details(acc) do
     receive do
-      {:trace, _, :send, {:ekv_sync, _, _, _mode, entries, progress}, _} ->
+      {:trace, _, :send, {:ekv_sync, _, _, _request_id, _mode, entries, progress}, _} ->
         collect_trace_sync_details([{length(entries), progress} | acc])
 
-      {:trace, _, :send, {:ekv, 1, :sync, {_, _, _mode, entries, progress}, _meta}, _} ->
+      {:trace, _, :send, {:ekv, 2, :sync, {_, _, _request_id, _mode, entries, progress}, _meta},
+       _} ->
         collect_trace_sync_details([{length(entries), progress} | acc])
 
       {:trace, _, :send, _, _} ->
@@ -6130,7 +6389,7 @@ defmodule EKVTest do
   defp collect_trace_replication_batch_messages(acc) do
     receive do
       {:trace, _, :send,
-       {:ekv, 1, :replication_batch, {from_node, shard, origin, entries}, _meta}, destination} ->
+       {:ekv, 2, :replication_batch, {from_node, shard, origin, entries}, _meta}, destination} ->
         collect_trace_replication_batch_messages([
           {:replication_batch, from_node, shard, origin, Enum.map(entries, &elem(&1, 0)),
            destination}
@@ -6775,6 +7034,44 @@ defmodule EKVTest do
 
       assert Exception.message(error) =~ ":allow_stale_startup is not supported in :client mode"
     end
+  end
+
+  defp expect_delta_sync(shard_name, source_node, origin_node, from_seq) do
+    origin_node =
+      cond do
+        is_binary(origin_node) -> origin_node
+        is_atom(origin_node) -> Atom.to_string(origin_node)
+        is_integer(origin_node) -> Integer.to_string(origin_node)
+      end
+
+    request_id = make_ref()
+
+    :sys.replace_state(shard_name, fn state ->
+      %{
+        state
+        | sync_requests:
+            Map.put(state.sync_requests, source_node, %{
+              request: {:delta, origin_node, from_seq},
+              id: request_id
+            })
+      }
+    end)
+
+    request_id
+  end
+
+  defp expect_full_sync(shard_name, source_node) do
+    request_id = make_ref()
+
+    :sys.replace_state(shard_name, fn state ->
+      %{
+        state
+        | sync_requests:
+            Map.put(state.sync_requests, source_node, %{request: :full, id: request_id})
+      }
+    end)
+
+    request_id
   end
 
   defp wire_compress(binary) when is_binary(binary) do

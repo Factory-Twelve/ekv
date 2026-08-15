@@ -74,7 +74,7 @@ defmodule EKV.Sqlite3NIF do
       ),
       do: :erlang.nif_error(:not_loaded)
 
-  def ekv_write_snapshot_entry(_db, _kv_stmt, _kv_args),
+  def ekv_write_snapshot_entries_batch(_db, _kv_stmt, _kv_args_lists),
     do: :erlang.nif_error(:not_loaded)
 
   def ekv_read_entry(_db, _stmt, _args), do: :erlang.nif_error(:not_loaded)

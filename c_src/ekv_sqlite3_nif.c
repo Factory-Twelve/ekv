@@ -1,7 +1,11 @@
 #include <limits.h>
+#include <stdint.h>
 #include <string.h>
 #include <erl_nif.h>
 #include "sqlite3.h"
+
+#define EKV_MAX_BALLOT_NODE_BYTES 1024
+#define EKV_MAX_CAS_COUNTER ((ErlNifSInt64)INT64_MAX - 1)
 
 /* ------------------------------------------------------------------ */
 /* Resource types                                                      */
@@ -93,6 +97,49 @@ static int copy_alloc(const void *src, size_t len, void **dst)
     memcpy(copy, src, len);
     *dst = copy;
     return 1;
+}
+
+static int valid_external_ballot_node(const ErlNifBinary *ballot_node)
+{
+    return ballot_node->size > 0 &&
+        ballot_node->size <= EKV_MAX_BALLOT_NODE_BYTES &&
+        memchr(ballot_node->data, '\0', ballot_node->size) == NULL;
+}
+
+static int valid_persisted_ballot(
+    ErlNifSInt64 counter,
+    const void *node,
+    size_t node_len
+)
+{
+    if (counter == 0)
+        return node_len == 0;
+
+    return counter > 0 &&
+        counter <= EKV_MAX_CAS_COUNTER &&
+        node != NULL &&
+        node_len > 0 &&
+        node_len <= EKV_MAX_BALLOT_NODE_BYTES &&
+        memchr(node, '\0', node_len) == NULL;
+}
+
+static int compare_ballot_nodes(
+    const void *left,
+    size_t left_len,
+    const void *right,
+    size_t right_len
+)
+{
+    size_t common_len = left_len < right_len ? left_len : right_len;
+    int result = common_len == 0 ? 0 : memcmp(left, right, common_len);
+
+    if (result != 0)
+        return result;
+    if (left_len < right_len)
+        return -1;
+    if (left_len > right_len)
+        return 1;
+    return 0;
 }
 
 static ERL_NIF_TERM make_sqlite_error(ErlNifEnv *env, sqlite3 *db)
@@ -400,6 +447,14 @@ static int bind_args(ErlNifEnv *env, sqlite3_stmt *stmt, ERL_NIF_TERM list)
     return 0;
 }
 
+static void reset_and_clear_bindings(sqlite3_stmt *stmt)
+{
+    if (stmt) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+    }
+}
+
 static int list_nth_term(ErlNifEnv *env, ERL_NIF_TERM list, unsigned nth, ERL_NIF_TERM *out)
 {
     ERL_NIF_TERM head;
@@ -692,6 +747,42 @@ static void rollback_tx(sqlite3 *db)
 static int commit_tx(sqlite3 *db)
 {
     return sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+}
+
+static void abort_paxos_tx(
+    connection_t *conn,
+    sqlite3_stmt *stmt,
+    void *allocation_a,
+    void *allocation_b,
+    void *allocation_c
+)
+{
+    if (stmt)
+        sqlite3_finalize(stmt);
+
+    rollback_tx(conn->db);
+    enif_mutex_unlock(conn->mutex);
+
+    if (allocation_a)
+        enif_free(allocation_a);
+    if (allocation_b)
+        enif_free(allocation_b);
+    if (allocation_c)
+        enif_free(allocation_c);
+}
+
+static ERL_NIF_TERM abort_snapshot_entries_batch(
+    connection_t *conn,
+    sqlite3_stmt *stmt,
+    int *applied_flags,
+    ERL_NIF_TERM result
+)
+{
+    reset_and_clear_bindings(stmt);
+    rollback_tx(conn->db);
+    enif_mutex_unlock(conn->mutex);
+    enif_free(applied_flags);
+    return result;
 }
 
 static int get_progress_entry(
@@ -1918,71 +2009,120 @@ static ERL_NIF_TERM ekv_write_local_entries_batch(ErlNifEnv *env, int argc, cons
 }
 
 /* ------------------------------------------------------------------ */
-/* NIF: write_snapshot_entry(db, kv_stmt, kv_args)                    */
-/*   -> {:ok, true} | {:ok, false} | {:error, msg}                    */
+/* NIF: write_snapshot_entries_batch(db, kv_stmt, kv_args_lists)      */
+/*   -> {:ok, [applied?]} | {:error, msg}                             */
 /*                                                                     */
-/* Full-sync apply updates current state only. It does not append to   */
-/* kv_oplog or advance replay progress.                                */
+/* Full-sync batch apply updates current state only. Every row is      */
+/* applied through the caller's cached LWW kv statement under one      */
+/* transaction. It does not append to kv_oplog or advance progress.    */
 /* ------------------------------------------------------------------ */
 
-static ERL_NIF_TERM ekv_write_snapshot_entry(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+static ERL_NIF_TERM ekv_write_snapshot_entries_batch(
+    ErlNifEnv *env,
+    int argc,
+    const ERL_NIF_TERM argv[]
+)
 {
     (void)argc;
     connection_t *conn;
+    statement_t *kv_s;
+    unsigned int entry_count = 0;
+    unsigned int idx = 0;
+    int *applied_flags = NULL;
+    ERL_NIF_TERM list;
+    ERL_NIF_TERM head;
+
     if (!enif_get_resource(env, argv[0], connection_type, (void **)&conn))
         return enif_make_badarg(env);
 
-    statement_t *kv_s;
     if (!enif_get_resource(env, argv[1], statement_type, (void **)&kv_s))
         return enif_make_badarg(env);
+
+    if (kv_s->conn != conn)
+        return make_error(env, "statement does not belong to this connection");
+
+    if (!enif_get_list_length(env, argv[2], &entry_count) || entry_count == 0)
+        return enif_make_badarg(env);
+
+    applied_flags = enif_alloc(sizeof(int) * entry_count);
+    if (!applied_flags)
+        return make_error(env, "alloc failed");
 
     enif_mutex_lock(conn->mutex);
     if (!conn->db) {
         enif_mutex_unlock(conn->mutex);
+        enif_free(applied_flags);
         return make_error(env, "database closed");
     }
     if (!kv_s->stmt) {
         enif_mutex_unlock(conn->mutex);
+        enif_free(applied_flags);
         return make_error(env, "statement finalized");
     }
 
-    int rc = sqlite3_exec(conn->db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    reset_and_clear_bindings(kv_s->stmt);
+
+    int rc = begin_immediate(conn->db);
     if (rc != SQLITE_OK) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+        reset_and_clear_bindings(kv_s->stmt);
         enif_mutex_unlock(conn->mutex);
+        enif_free(applied_flags);
         return err;
     }
 
-    int br = bind_args(env, kv_s->stmt, argv[2]);
-    if (br != 0) {
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        return (br == -1) ? enif_make_badarg(env)
-                          : make_sqlite_error(env, conn->db);
+    list = argv[2];
+    while (enif_get_list_cell(env, list, &head, &list)) {
+        unsigned int arg_count = 0;
+        int bind_rc;
+
+        if (!enif_get_list_length(env, head, &arg_count) ||
+            arg_count != (unsigned int)sqlite3_bind_parameter_count(kv_s->stmt)) {
+            return abort_snapshot_entries_batch(
+                conn,
+                kv_s->stmt,
+                applied_flags,
+                enif_make_badarg(env)
+            );
+        }
+
+        bind_rc = bind_args(env, kv_s->stmt, head);
+        if (bind_rc != 0) {
+            ERL_NIF_TERM err = bind_rc == -1
+                ? enif_make_badarg(env)
+                : make_sqlite_error(env, conn->db);
+            return abort_snapshot_entries_batch(conn, kv_s->stmt, applied_flags, err);
+        }
+
+        rc = sqlite3_step(kv_s->stmt);
+        if (rc != SQLITE_DONE) {
+            ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
+            return abort_snapshot_entries_batch(conn, kv_s->stmt, applied_flags, err);
+        }
+
+        applied_flags[idx] = sqlite3_changes(conn->db) > 0;
+        idx++;
+        reset_and_clear_bindings(kv_s->stmt);
     }
 
-    rc = sqlite3_step(kv_s->stmt);
-    if (rc != SQLITE_DONE) {
-        ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        sqlite3_reset(kv_s->stmt);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        return err;
-    }
-    sqlite3_reset(kv_s->stmt);
-
-    int changes = sqlite3_changes(conn->db);
-
-    rc = sqlite3_exec(conn->db, "COMMIT", NULL, NULL, NULL);
+    rc = commit_tx(conn->db);
     if (rc != SQLITE_OK) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        return err;
+        return abort_snapshot_entries_batch(conn, kv_s->stmt, applied_flags, err);
     }
 
+    reset_and_clear_bindings(kv_s->stmt);
     enif_mutex_unlock(conn->mutex);
-    return enif_make_tuple2(env, atom_ok, changes > 0 ? atom_true : atom_false);
+
+    ERL_NIF_TERM applied_flags_list = enif_make_list(env, 0);
+    while (idx > 0) {
+        idx--;
+        applied_flags_list =
+            enif_make_list_cell(env, applied_flags[idx] ? atom_true : atom_false, applied_flags_list);
+    }
+    enif_free(applied_flags);
+
+    return enif_make_tuple2(env, atom_ok, applied_flags_list);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2555,14 +2695,16 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
         return enif_make_badarg(env);
 
     ErlNifSInt64 ballot_c;
-    if (!enif_get_int64(env, argv[2], &ballot_c))
+    if (!enif_get_int64(env, argv[2], &ballot_c) ||
+        ballot_c <= 0 || ballot_c > EKV_MAX_CAS_COUNTER)
         return enif_make_badarg(env);
 
     ErlNifBinary ballot_n_bin;
-    if (!enif_inspect_iolist_as_binary(env, argv[3], &ballot_n_bin))
+    if (!enif_inspect_binary(env, argv[3], &ballot_n_bin) ||
+        !valid_external_ballot_node(&ballot_n_bin))
         return enif_make_badarg(env);
 
-    /* Null-terminate ballot_n for strcmp */
+    /* Bound and validate before allocation or narrowing the byte length. */
     char *ballot_n_str = enif_alloc(ballot_n_bin.size + 1);
     if (!ballot_n_str) return make_error(env, "alloc failed");
     memcpy(ballot_n_str, ballot_n_bin.data, ballot_n_bin.size);
@@ -2594,9 +2736,7 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
         "FROM kv_paxos WHERE key = ?1", -1, 0, &sel, NULL);
     if (rc != SQLITE_OK) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
+        abort_paxos_tx(conn, sel, ballot_n_str, NULL, NULL);
         return err;
     }
     sqlite3_bind_text(sel, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
@@ -2632,23 +2772,31 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
             has_accepted_value = 1;
             for (int i = 0; i < 5; i++) {
                 if (!make_column(env, sel, 4 + i, &paxos_value_cols[i])) {
-                    sqlite3_finalize(sel);
-                    sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-                    enif_mutex_unlock(conn->mutex);
-                    enif_free(ballot_n_str);
+                    abort_paxos_tx(conn, sel, ballot_n_str, NULL, NULL);
                     return make_error(env, "alloc failed");
                 }
             }
         }
     }
 
+    if (!valid_persisted_ballot(
+            promised_c,
+            promised_n_str,
+            (size_t)promised_n_len
+        ) ||
+        !valid_persisted_ballot(
+            accepted_c,
+            accepted_n_str,
+            (size_t)accepted_n_len
+        )) {
+        abort_paxos_tx(conn, sel, ballot_n_str, NULL, NULL);
+        return make_error(env, "invalid persisted Paxos ballot");
+    }
+
     /* Copy accepted_n before finalizing (data owned by stmt) */
     char *accepted_n_copy = enif_alloc(accepted_n_len + 1);
     if (!accepted_n_copy) {
-        sqlite3_finalize(sel);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
+        abort_paxos_tx(conn, sel, ballot_n_str, NULL, NULL);
         return make_error(env, "alloc failed");
     }
     memcpy(accepted_n_copy, accepted_n_str, accepted_n_len);
@@ -2659,7 +2807,12 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
     if (ballot_c != promised_c) {
         ballot_wins = ballot_c > promised_c;
     } else {
-        ballot_wins = strcmp(ballot_n_str, promised_n_str) > 0;
+        ballot_wins = compare_ballot_nodes(
+            ballot_n_str,
+            ballot_n_bin.size,
+            promised_n_str,
+            (size_t)promised_n_len
+        ) > 0;
     }
 
     if (!ballot_wins) {
@@ -2667,19 +2820,13 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
         int prom_n_len_copy = promised_n_len;
         char *prom_n_copy = enif_alloc(prom_n_len_copy + 1);
         if (!prom_n_copy) {
-            sqlite3_finalize(sel);
-            sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-            enif_mutex_unlock(conn->mutex);
-            enif_free(ballot_n_str);
-            enif_free(accepted_n_copy);
+            abort_paxos_tx(conn, sel, ballot_n_str, accepted_n_copy, NULL);
             return make_error(env, "alloc failed");
         }
         memcpy(prom_n_copy, promised_n_str, prom_n_len_copy);
         prom_n_copy[prom_n_len_copy] = '\0';
 
-        sqlite3_finalize(sel);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
+        abort_paxos_tx(conn, sel, NULL, NULL, NULL);
 
         ERL_NIF_TERM promised_n_term;
         {
@@ -2715,10 +2862,7 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
     }
     if (rc != SQLITE_OK) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
-        enif_free(accepted_n_copy);
+        abort_paxos_tx(conn, ups, ballot_n_str, accepted_n_copy, NULL);
         return err;
     }
     sqlite3_bind_text(ups, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
@@ -2728,10 +2872,7 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
     sqlite3_finalize(ups);
     if (rc != SQLITE_DONE) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
-        enif_free(accepted_n_copy);
+        abort_paxos_tx(conn, NULL, ballot_n_str, accepted_n_copy, NULL);
         return err;
     }
 
@@ -2748,10 +2889,7 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
             -1, 0, &kv_sel, NULL);
         if (rc != SQLITE_OK) {
             ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-            sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-            enif_mutex_unlock(conn->mutex);
-            enif_free(ballot_n_str);
-            enif_free(accepted_n_copy);
+            abort_paxos_tx(conn, kv_sel, ballot_n_str, accepted_n_copy, NULL);
             return err;
         }
         sqlite3_bind_text(kv_sel, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
@@ -2762,11 +2900,7 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
             ERL_NIF_TERM cols[5];
             for (int i = 0; i < ncols && i < 5; i++) {
                 if (!make_column(env, kv_sel, i, &cols[i])) {
-                    sqlite3_finalize(kv_sel);
-                    sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-                    enif_mutex_unlock(conn->mutex);
-                    enif_free(ballot_n_str);
-                    enif_free(accepted_n_copy);
+                    abort_paxos_tx(conn, kv_sel, ballot_n_str, accepted_n_copy, NULL);
                     return make_error(env, "alloc failed");
                 }
             }
@@ -2781,10 +2915,7 @@ static ERL_NIF_TERM ekv_paxos_prepare(ErlNifEnv *env, int argc, const ERL_NIF_TE
     rc = sqlite3_exec(conn->db, "COMMIT", NULL, NULL, NULL);
     if (rc != SQLITE_OK) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
-        enif_free(accepted_n_copy);
+        abort_paxos_tx(conn, NULL, ballot_n_str, accepted_n_copy, NULL);
         return err;
     }
 
@@ -2833,14 +2964,16 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
         return enif_make_badarg(env);
 
     ErlNifSInt64 ballot_c;
-    if (!enif_get_int64(env, argv[2], &ballot_c))
+    if (!enif_get_int64(env, argv[2], &ballot_c) ||
+        ballot_c <= 0 || ballot_c > EKV_MAX_CAS_COUNTER)
         return enif_make_badarg(env);
 
     ErlNifBinary ballot_n_bin;
-    if (!enif_inspect_iolist_as_binary(env, argv[3], &ballot_n_bin))
+    if (!enif_inspect_binary(env, argv[3], &ballot_n_bin) ||
+        !valid_external_ballot_node(&ballot_n_bin))
         return enif_make_badarg(env);
 
-    /* Null-terminate ballot_n for strcmp */
+    /* Bound and validate before allocation or narrowing the byte length. */
     char *ballot_n_str = enif_alloc(ballot_n_bin.size + 1);
     if (!ballot_n_str) return make_error(env, "alloc failed");
     memcpy(ballot_n_str, ballot_n_bin.data, ballot_n_bin.size);
@@ -2857,6 +2990,10 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
             return enif_make_badarg(env);
         }
         val_elems[i] = head;
+    }
+    if (!enif_is_empty_list(env, val_list)) {
+        enif_free(ballot_n_str);
+        return enif_make_badarg(env);
     }
 
     enif_mutex_lock(conn->mutex);
@@ -2882,9 +3019,7 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
         -1, 0, &sel, NULL);
     if (rc != SQLITE_OK) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
+        abort_paxos_tx(conn, sel, ballot_n_str, NULL, NULL);
         return err;
     }
     sqlite3_bind_text(sel, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
@@ -2892,12 +3027,23 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
     rc = sqlite3_step(sel);
     ErlNifSInt64 promised_c = 0;
     const char *promised_n_str = "";
+    int promised_n_len = 0;
 
     if (rc == SQLITE_ROW) {
         promised_c = sqlite3_column_int64(sel, 0);
         if (sqlite3_column_type(sel, 1) != SQLITE_NULL) {
             promised_n_str = (const char *)sqlite3_column_text(sel, 1);
+            promised_n_len = sqlite3_column_bytes(sel, 1);
         }
+    }
+
+    if (!valid_persisted_ballot(
+            promised_c,
+            promised_n_str,
+            (size_t)promised_n_len
+        )) {
+        abort_paxos_tx(conn, sel, ballot_n_str, NULL, NULL);
+        return make_error(env, "invalid persisted Paxos ballot");
     }
 
     /* ballot >= promised? */
@@ -2905,15 +3051,18 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
     if (ballot_c != promised_c) {
         ballot_ok = ballot_c > promised_c;
     } else {
-        ballot_ok = strcmp(ballot_n_str, promised_n_str) >= 0;
+        ballot_ok = compare_ballot_nodes(
+            ballot_n_str,
+            ballot_n_bin.size,
+            promised_n_str,
+            (size_t)promised_n_len
+        ) >= 0;
     }
 
     sqlite3_finalize(sel);
 
     if (!ballot_ok) {
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
+        abort_paxos_tx(conn, NULL, ballot_n_str, NULL, NULL);
         return enif_make_tuple2(env, atom_ok, atom_false);
     }
 
@@ -2934,9 +3083,7 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
         -1, 0, &pax_ups, NULL);
     if (rc != SQLITE_OK) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
+        abort_paxos_tx(conn, pax_ups, ballot_n_str, NULL, NULL);
         return err;
     }
     sqlite3_bind_text(pax_ups, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
@@ -2952,10 +3099,7 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
                 && strcmp(atom_buf, "nil") == 0) {
                 sqlite3_bind_null(pax_ups, pos);
             } else {
-                sqlite3_finalize(pax_ups);
-                sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-                enif_mutex_unlock(conn->mutex);
-                enif_free(ballot_n_str);
+                abort_paxos_tx(conn, pax_ups, ballot_n_str, NULL, NULL);
                 return enif_make_badarg(env);
             }
         } else if (enif_is_number(env, val_elems[i])) {
@@ -2966,19 +3110,13 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
             } else if (enif_get_double(env, val_elems[i], &dval)) {
                 sqlite3_bind_double(pax_ups, pos, dval);
             } else {
-                sqlite3_finalize(pax_ups);
-                sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-                enif_mutex_unlock(conn->mutex);
-                enif_free(ballot_n_str);
+                abort_paxos_tx(conn, pax_ups, ballot_n_str, NULL, NULL);
                 return enif_make_badarg(env);
             }
         } else if (enif_is_binary(env, val_elems[i])) {
             ErlNifBinary bin;
             if (!enif_inspect_binary(env, val_elems[i], &bin)) {
-                sqlite3_finalize(pax_ups);
-                sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-                enif_mutex_unlock(conn->mutex);
-                enif_free(ballot_n_str);
+                abort_paxos_tx(conn, pax_ups, ballot_n_str, NULL, NULL);
                 return enif_make_badarg(env);
             }
             if (i == 0) {
@@ -2989,10 +3127,7 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
                 sqlite3_bind_text(pax_ups, pos, (const char *)bin.data, (int)bin.size, SQLITE_TRANSIENT);
             }
         } else {
-            sqlite3_finalize(pax_ups);
-            sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-            enif_mutex_unlock(conn->mutex);
-            enif_free(ballot_n_str);
+            abort_paxos_tx(conn, pax_ups, ballot_n_str, NULL, NULL);
             return enif_make_badarg(env);
         }
     }
@@ -3001,9 +3136,7 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
     sqlite3_finalize(pax_ups);
     if (rc != SQLITE_DONE) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
+        abort_paxos_tx(conn, NULL, ballot_n_str, NULL, NULL);
         return err;
     }
 
@@ -3011,9 +3144,7 @@ static ERL_NIF_TERM ekv_paxos_accept(ErlNifEnv *env, int argc, const ERL_NIF_TER
     rc = sqlite3_exec(conn->db, "COMMIT", NULL, NULL, NULL);
     if (rc != SQLITE_OK) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
+        abort_paxos_tx(conn, NULL, ballot_n_str, NULL, NULL);
         return err;
     }
 
@@ -3061,22 +3192,25 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         return enif_make_badarg(env);
 
     ErlNifSInt64 ballot_c;
-    if (!enif_get_int64(env, argv[5], &ballot_c))
+    if (!enif_get_int64(env, argv[5], &ballot_c) ||
+        ballot_c <= 0 || ballot_c > EKV_MAX_CAS_COUNTER)
         return enif_make_badarg(env);
 
     ErlNifBinary ballot_n_bin;
-    if (!enif_inspect_iolist_as_binary(env, argv[6], &ballot_n_bin))
+    if (!enif_inspect_binary(env, argv[6], &ballot_n_bin) ||
+        !valid_external_ballot_node(&ballot_n_bin))
         return enif_make_badarg(env);
 
     sqlite3_int64 origin_seq = 0;
     sqlite3_int64 local_progress_seq = 0;
     int origin_seq_provided = !enif_is_identical(argv[7], atom_nil);
     if (origin_seq_provided) {
-        if (!enif_get_int64(env, argv[7], (ErlNifSInt64 *)&origin_seq))
+        if (!enif_get_int64(env, argv[7], (ErlNifSInt64 *)&origin_seq) ||
+            origin_seq < 0 || origin_seq > EKV_MAX_CAS_COUNTER)
             return enif_make_badarg(env);
     }
 
-    /* Null-terminate ballot_n for strcmp */
+    /* Bound and validate before allocation. */
     char *ballot_n_str = enif_alloc(ballot_n_bin.size + 1);
     if (!ballot_n_str) return make_error(env, "alloc failed");
     memcpy(ballot_n_str, ballot_n_bin.data, ballot_n_bin.size);
@@ -3107,9 +3241,7 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         rc = next_local_origin_seq(conn, &origin_seq);
         if (rc != SQLITE_OK) {
             ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-            sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-            enif_mutex_unlock(conn->mutex);
-            enif_free(ballot_n_str);
+            abort_paxos_tx(conn, NULL, ballot_n_str, NULL, NULL);
             return err;
         }
     }
@@ -3124,9 +3256,7 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         -1, 0, &sel, NULL);
     if (rc != SQLITE_OK) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
+        abort_paxos_tx(conn, sel, ballot_n_str, NULL, NULL);
         return err;
     }
     sqlite3_bind_text(sel, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
@@ -3135,24 +3265,31 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
 
     /* 3. Check if ballot matches */
     if (rc != SQLITE_ROW) {
-        sqlite3_finalize(sel);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
+        abort_paxos_tx(conn, sel, ballot_n_str, NULL, NULL);
         return enif_make_tuple2(env, atom_ok, atom_stale);
     }
 
     ErlNifSInt64 acc_c = sqlite3_column_int64(sel, 0);
     const char *acc_n_str = "";
+    int acc_n_len = 0;
     if (sqlite3_column_type(sel, 1) != SQLITE_NULL) {
         acc_n_str = (const char *)sqlite3_column_text(sel, 1);
+        acc_n_len = sqlite3_column_bytes(sel, 1);
     }
 
-    if (acc_c != ballot_c || strcmp(acc_n_str, ballot_n_str) != 0) {
-        sqlite3_finalize(sel);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
+    if (!valid_persisted_ballot(acc_c, acc_n_str, (size_t)acc_n_len)) {
+        abort_paxos_tx(conn, sel, ballot_n_str, NULL, NULL);
+        return make_error(env, "invalid persisted Paxos ballot");
+    }
+
+    if (acc_c != ballot_c ||
+        compare_ballot_nodes(
+            acc_n_str,
+            (size_t)acc_n_len,
+            ballot_n_str,
+            ballot_n_bin.size
+        ) != 0) {
+        abort_paxos_tx(conn, sel, ballot_n_str, NULL, NULL);
         return enif_make_tuple2(env, atom_ok, atom_stale);
     }
 
@@ -3167,10 +3304,7 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         !make_column(env, sel, 4, &origin_term) ||
         !make_column(env, sel, 5, &expires_term) ||
         !make_column(env, sel, 6, &deleted_term)) {
-        sqlite3_finalize(sel);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
+        abort_paxos_tx(conn, sel, ballot_n_str, NULL, NULL);
         return make_error(env, "alloc failed");
     }
 
@@ -3201,19 +3335,12 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     /* Copy value data before finalizing sel (data owned by stmt) */
     void *value_copy = NULL;
     if (!copy_alloc(value_data, (size_t)value_len, &value_copy)) {
-        sqlite3_finalize(sel);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
+        abort_paxos_tx(conn, sel, ballot_n_str, NULL, NULL);
         return make_error(env, "alloc failed");
     }
     char *origin_copy = NULL;
     if (!copy_alloc(origin_data, (size_t)origin_len, (void **)&origin_copy)) {
-        if (value_copy) enif_free(value_copy);
-        sqlite3_finalize(sel);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
-        enif_free(ballot_n_str);
+        abort_paxos_tx(conn, sel, ballot_n_str, value_copy, NULL);
         return make_error(env, "alloc failed");
     }
 
@@ -3229,12 +3356,13 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
         sqlite3_bind_text(prev_sel, 1, (const char *)key_bin.data, (int)key_bin.size, SQLITE_TRANSIENT);
         if (sqlite3_step(prev_sel) == SQLITE_ROW) {
             if (!make_column(env, prev_sel, 0, &prev_value)) {
-                sqlite3_finalize(prev_sel);
-                if (value_copy) enif_free(value_copy);
-                if (origin_copy) enif_free(origin_copy);
-                enif_free(ballot_n_str);
-                sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-                enif_mutex_unlock(conn->mutex);
+                abort_paxos_tx(
+                    conn,
+                    prev_sel,
+                    ballot_n_str,
+                    value_copy,
+                    origin_copy
+                );
                 return make_error(env, "alloc failed");
             }
         }
@@ -3268,11 +3396,7 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     if (rc != SQLITE_DONE) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
         sqlite3_reset(kv_s->stmt);
-        if (value_copy) enif_free(value_copy);
-        if (origin_copy) enif_free(origin_copy);
-        enif_free(ballot_n_str);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
+        abort_paxos_tx(conn, NULL, ballot_n_str, value_copy, origin_copy);
         return err;
     }
     sqlite3_reset(kv_s->stmt);
@@ -3288,11 +3412,7 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     if (rc != SQLITE_OK) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
         sqlite3_reset(keyref_s->stmt);
-        if (value_copy) enif_free(value_copy);
-        if (origin_copy) enif_free(origin_copy);
-        enif_free(ballot_n_str);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
+        abort_paxos_tx(conn, NULL, ballot_n_str, value_copy, origin_copy);
         return err;
     }
     sqlite3_reset(keyref_s->stmt);
@@ -3321,11 +3441,7 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     if (rc != SQLITE_DONE) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
         sqlite3_reset(oplog_s->stmt);
-        if (value_copy) enif_free(value_copy);
-        if (origin_copy) enif_free(origin_copy);
-        enif_free(ballot_n_str);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
+        abort_paxos_tx(conn, NULL, ballot_n_str, value_copy, origin_copy);
         return err;
     }
     sqlite3_reset(oplog_s->stmt);
@@ -3349,28 +3465,25 @@ static ERL_NIF_TERM ekv_paxos_promote(ErlNifEnv *env, int argc, const ERL_NIF_TE
     }
     if (rc != SQLITE_OK) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        if (value_copy) enif_free(value_copy);
-        if (origin_copy) enif_free(origin_copy);
-        enif_free(ballot_n_str);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
+        abort_paxos_tx(conn, NULL, ballot_n_str, value_copy, origin_copy);
         return err;
     }
 
     /* 7. COMMIT */
     rc = sqlite3_exec(conn->db, "COMMIT", NULL, NULL, NULL);
-    if (value_copy) enif_free(value_copy);
-    if (origin_copy) enif_free(origin_copy);
-    enif_free(ballot_n_str);
 
     if (rc != SQLITE_OK) {
         ERL_NIF_TERM err = make_sqlite_error(env, conn->db);
-        sqlite3_exec(conn->db, "ROLLBACK", NULL, NULL, NULL);
-        enif_mutex_unlock(conn->mutex);
+        abort_paxos_tx(conn, NULL, ballot_n_str, value_copy, origin_copy);
         return err;
     }
 
     enif_mutex_unlock(conn->mutex);
+    enif_free(ballot_n_str);
+    if (value_copy)
+        enif_free(value_copy);
+    if (origin_copy)
+        enif_free(origin_copy);
 
     /* {:ok, value, timestamp, origin, expires_at, deleted_at, prev_value_or_nil, origin_seq, local_progress_seq} */
     return enif_make_tuple(
@@ -3403,7 +3516,8 @@ static ErlNifFunc nif_funcs[] = {
     {"ekv_write_entry",   8, ekv_write_entry,   ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_write_entries_batch", 6, ekv_write_entries_batch, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_write_local_entries_batch", 8, ekv_write_local_entries_batch, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"ekv_write_snapshot_entry", 3, ekv_write_snapshot_entry, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"ekv_write_snapshot_entries_batch", 3, ekv_write_snapshot_entries_batch,
+        ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_read_entry",    3, ekv_read_entry,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_fetch_all",     3, ekv_fetch_all,     ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"ekv_backup",        2, ekv_backup,        ERL_NIF_DIRTY_JOB_IO_BOUND},

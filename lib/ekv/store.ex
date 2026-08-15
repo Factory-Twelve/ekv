@@ -526,22 +526,28 @@ defmodule EKV.Store do
   end
 
   @doc """
-  Apply a full-sync snapshot row to `kv` without appending replay history.
+  Apply a non-empty full-sync snapshot batch to `kv` in one transaction.
+
+  Returns `{:ok, applied_flags}` where the flags preserve per-entry LWW
+  outcomes in input order. Snapshot batches do not append replay history or
+  advance replay progress.
   """
-  def write_snapshot_entry(
-        db,
-        kv_stmt,
-        key,
-        value_binary,
-        timestamp,
-        origin_node,
-        origin_seq,
-        expires_at,
-        deleted_at \\ nil
-      ) do
-    origin_str = persisted_member_id(origin_node)
-    kv_args = [key, value_binary, timestamp, origin_str, origin_seq, expires_at, deleted_at]
-    EKV.Sqlite3.write_snapshot_entry(db, kv_stmt, kv_args)
+  def write_snapshot_entries_batch(db, kv_stmt, entries) when is_list(entries) do
+    kv_args_lists =
+      Enum.map(entries, fn
+        {key, value_binary, timestamp, origin_node, origin_seq, expires_at, deleted_at} ->
+          [
+            key,
+            value_binary,
+            timestamp,
+            persisted_member_id(origin_node),
+            origin_seq,
+            expires_at,
+            deleted_at
+          ]
+      end)
+
+    EKV.Sqlite3.write_snapshot_entries_batch(db, kv_stmt, kv_args_lists)
   end
 
   # =====================================================================
@@ -1630,6 +1636,22 @@ defmodule EKV.Store do
 
   def paxos_accept(db, key, ballot_c, ballot_n, value_args) do
     EKV.Sqlite3.paxos_accept(db, key, ballot_c, ballot_n, value_args)
+  end
+
+  @paxos_accepted_sql """
+  SELECT accepted_value, accepted_timestamp, accepted_origin,
+         accepted_expires_at, accepted_deleted_at
+  FROM kv_paxos
+  WHERE key = ?1 AND accepted_counter = ?2 AND accepted_node = ?3
+  """
+
+  @doc false
+  def paxos_accepted(db, key, ballot_c, ballot_n) do
+    case EKV.Sqlite3.fetch_all(db, @paxos_accepted_sql, [key, ballot_c, ballot_n]) do
+      {:ok, [row]} -> {:ok, row}
+      {:ok, []} -> :stale
+      {:error, _reason} = error -> error
+    end
   end
 
   def paxos_promote(
