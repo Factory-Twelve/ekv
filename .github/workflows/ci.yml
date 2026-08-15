@@ -24,6 +24,31 @@ jobs:
           otp-version: ${{ matrix.otp }}
           elixir-version: ${{ matrix.elixir }}
 
-      - run: mix deps.get
+      - run: mix deps.get --check-locked
+      - run: mix format --check-formatted
+      - run: MIX_ENV=prod mix deps.compile
+      - run: MIX_ENV=prod mix compile --warnings-as-errors
       - run: mix compile --warnings-as-errors
       - run: elixir --name ci@127.0.0.1 --cookie ekv_test -S mix test
+
+      - name: Prove packaged production build needs no network
+        env:
+          PACKAGE_DIR: ${{ runner.temp }}/ekv-source-package
+        run: |
+          MIX_ENV=docs mix hex.build --unpack --output "$PACKAGE_DIR"
+          (
+            cd "$PACKAGE_DIR"
+            test -f c_src/ekv_sqlite3_nif.c
+            test -f c_src/sqlite3.c
+            test -f Makefile
+            test ! -e checksum.exs
+            test -z "$(find . -type f \( -name '*.so' -o -name '*.dylib' -o -name '*.dll' \) -print -quit)"
+            MIX_ENV=prod mix deps.get --only prod
+          )
+          sudo env "PATH=$PATH" "HOME=$HOME" "PACKAGE_DIR=$PACKAGE_DIR" \
+            unshare --net -- sh -eu -c '
+              ip link set lo up
+              cd "$PACKAGE_DIR"
+              MIX_ENV=prod mix deps.compile --force
+              MIX_ENV=prod mix compile --force --warnings-as-errors
+            '

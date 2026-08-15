@@ -14,13 +14,13 @@ CFLAGS += -O2 -fPIC -I$(ERL_INCLUDE) -Ic_src \
   -DSQLITE_LIKE_DOESNT_MATCH_BLOBS=1 \
   -DNDEBUG=1
 
-# Cross-compilation: cc_precompiler sets CROSSCOMPILE prefix
+# Optional cross-compilation prefix
 ifdef CROSSCOMPILE
   CC = $(CROSSCOMPILE)gcc
 endif
 
 # Platform-specific linker flags
-# cc_precompiler sets TARGET_ABI; fall back to uname for native builds
+# TARGET_ABI may be supplied by a cross-build; fall back to uname for native builds
 ifndef TARGET_ABI
   UNAME_S := $(shell uname -s)
   ifeq ($(UNAME_S),Darwin)
